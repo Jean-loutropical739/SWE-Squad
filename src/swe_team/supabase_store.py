@@ -17,6 +17,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from src.swe_team.models import SWETicket, TicketStatus
@@ -68,6 +69,9 @@ class SupabaseTicketStore:
         }
         # Fingerprint cache — loaded lazily on first access
         self._fingerprint_cache: Optional[Set[str]] = None
+        # Track last successful API activity for keep-alive logic.
+        # Supabase free tier pauses after 7 days of inactivity.
+        self._last_activity: datetime = datetime.now(timezone.utc)
 
     # ------------------------------------------------------------------
     # Public interface (mirrors TicketStore)
@@ -139,12 +143,158 @@ class SupabaseTicketStore:
         rows = self._request("GET", "/swe_tickets", params=params)
         return [self._row_to_ticket(r) for r in (rows or [])]
 
+    def list_recently_resolved(self, hours: int = 24) -> List[SWETicket]:
+        """Return tickets resolved within the last *hours* hours."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat()
+        params = {
+            "team_id": f"eq.{self._team_id}",
+            "status": "eq.resolved",
+            "updated_at": f"gte.{cutoff}",
+            "order": "updated_at.desc",
+        }
+        rows = self._request("GET", "/swe_tickets", params=params)
+        return [self._row_to_ticket(r) for r in (rows or [])]
+
+    def store_embedding(self, ticket_id: str, embedding: List[float]) -> None:
+        """Persist an embedding vector for an existing ticket."""
+        params = {
+            "ticket_id": f"eq.{ticket_id}",
+            "team_id": f"eq.{self._team_id}",
+        }
+        self._request(
+            "PATCH",
+            "/swe_tickets",
+            params=params,
+            body={"embedding": self._vector_literal(embedding)},
+        )
+
+    def find_similar(
+        self,
+        embedding: List[float],
+        *,
+        top_k: int = 5,
+        similarity_floor: float = 0.75,
+        max_age_days: int = 180,
+    ) -> List[Dict[str, Any]]:
+        """Query the pgvector similarity RPC for resolved/closed matches."""
+        payload = {
+            "query_embedding": self._vector_literal(embedding),
+            "team": self._team_id,
+            "match_count": top_k,
+            "similarity_floor": similarity_floor,
+            "max_age_days": max_age_days,
+        }
+        rows = self._request("POST", "/rpc/match_similar_tickets", body=payload)
+        return rows or []
+
+    def store_embedding_with_dedup(
+        self,
+        ticket: SWETicket,
+        embedding: List[float],
+        *,
+        dedup_threshold: float = 0.92,
+    ) -> str:
+        """Store embedding with semantic deduplication and memory merge behavior."""
+        matches = self.find_similar(
+            embedding,
+            top_k=1,
+            similarity_floor=dedup_threshold,
+        )
+        if not matches:
+            self.store_embedding(ticket.ticket_id, embedding)
+            return "stored"
+
+        candidate_id = str(matches[0].get("ticket_id") or "")
+        if not candidate_id or candidate_id == ticket.ticket_id:
+            self.store_embedding(ticket.ticket_id, embedding)
+            return "stored"
+
+        existing = self.get(candidate_id)
+        if not existing:
+            self.store_embedding(ticket.ticket_id, embedding)
+            return "stored"
+
+        if self._memory_detail_score(existing) >= self._memory_detail_score(ticket):
+            return "skipped"
+
+        params = {
+            "ticket_id": f"eq.{candidate_id}",
+            "team_id": f"eq.{self._team_id}",
+        }
+        self._request(
+            "PATCH",
+            "/swe_tickets",
+            params=params,
+            body={
+                "investigation_report": ticket.investigation_report,
+                "proposed_fix": ticket.proposed_fix,
+                "embedding": self._vector_literal(embedding),
+            },
+        )
+        return "merged"
+
+    def record_memory_hit(self, ticket_id: str, team_id: Optional[str] = None) -> None:
+        """Increment confidence for a memory ticket that was used."""
+        self._request(
+            "POST",
+            "/rpc/increment_memory_confidence",
+            body={
+                "p_ticket_id": ticket_id,
+                "p_team": team_id or self._team_id,
+            },
+        )
+
     @property
     def known_fingerprints(self) -> Set[str]:
         """Fingerprints of all stored tickets for this team (for dedup)."""
         if self._fingerprint_cache is None:
             self._fingerprint_cache = self._load_fingerprints()
         return set(self._fingerprint_cache)
+
+    # ------------------------------------------------------------------
+    # Keep-alive (prevents Supabase free-tier pause after 7 days)
+    # ------------------------------------------------------------------
+
+    def keep_alive(self, threshold_days: int = 5) -> bool:
+        """Ping Supabase if no organic activity within *threshold_days*.
+
+        Supabase free-tier pauses the database after 7 consecutive days
+        of inactivity.  This method checks the internal activity tracker
+        and, only when needed, issues a lightweight ``SELECT`` to count
+        as activity.
+
+        Returns ``True`` if a keep-alive ping was sent, ``False`` if
+        organic traffic was recent enough to skip it.
+        """
+        age = datetime.now(timezone.utc) - self._last_activity
+        if age < timedelta(days=threshold_days):
+            logger.info(
+                "Supabase keep-alive: skipped (last activity %s ago)",
+                age,
+            )
+            return False
+
+        logger.info(
+            "Supabase keep-alive: pinging (last activity %s ago, "
+            "threshold=%d days)",
+            age,
+            threshold_days,
+        )
+        try:
+            self._request(
+                "GET",
+                "/swe_tickets",
+                params={"select": "ticket_id", "limit": "1"},
+            )
+            logger.info("Supabase keep-alive: ping successful")
+            return True
+        except Exception:
+            logger.warning(
+                "Supabase keep-alive: ping failed", exc_info=True,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Audit trail
@@ -203,6 +353,7 @@ class SupabaseTicketStore:
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 raw = resp.read().decode()
+                self._last_activity = datetime.now(timezone.utc)
                 if raw:
                     return json.loads(raw)
                 return None
@@ -265,3 +416,16 @@ class SupabaseTicketStore:
             len(fps), self._team_id,
         )
         return fps
+
+    @staticmethod
+    def _vector_literal(embedding: List[float]) -> str:
+        """Convert a list of floats into pgvector text literal format."""
+        return "[" + ",".join(str(float(v)) for v in embedding) + "]"
+
+    @staticmethod
+    def _memory_detail_score(ticket: SWETicket) -> tuple[int, int]:
+        """Rank memory richness by populated fields and text detail."""
+        report = (ticket.investigation_report or "").strip()
+        fix = (ticket.proposed_fix or "").strip()
+        populated = int(bool(report)) + int(bool(fix))
+        return populated, len(report) + len(fix)

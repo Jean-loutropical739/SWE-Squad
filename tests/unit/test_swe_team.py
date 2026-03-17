@@ -14,6 +14,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -41,6 +43,8 @@ from src.swe_team.investigator import InvestigatorAgent, _parse_cost
 from src.swe_team.ralph_wiggum import RalphWiggumGate
 from src.swe_team.governance import DeploymentGovernor, DeploymentRecord, check_fix_complexity
 from src.swe_team.developer import DeveloperAgent
+from src.swe_team.embeddings import _ticket_text, embed_ticket, extract_memory_facts
+from src.swe_team.supabase_store import SupabaseTicketStore
 from src.swe_team.ticket_store import TicketStore
 
 
@@ -252,7 +256,9 @@ class TestSWETeamConfig:
 
 class TestLoadConfig:
     def test_load_missing_file(self):
-        cfg = load_config("/nonexistent/path.yaml")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SWE_TEAM_ENABLED", None)
+            cfg = load_config("/nonexistent/path.yaml")
         assert isinstance(cfg, SWETeamConfig)
         assert cfg.enabled is False
 
@@ -262,7 +268,9 @@ class TestLoadConfig:
         ) as f:
             f.write("enabled: false\ngovernance:\n  max_open_high: 10\n")
             f.flush()
-            cfg = load_config(f.name)
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("SWE_TEAM_ENABLED", None)
+                cfg = load_config(f.name)
         os.unlink(f.name)
         assert cfg.enabled is False
         assert cfg.governance.max_open_high == 10
@@ -356,6 +364,175 @@ class TestMonitorAgent:
         events = agent.build_events([ticket])
         assert len(events) == 1
         assert events[0].event == SWEEventType.ISSUE_DETECTED
+
+
+class TestMonitorSelfReferentialGuard:
+    """Regression tests for issues #8 / #9 — recursive ticket prevention."""
+
+    def test_scan_file_skips_excluded_patterns(self):
+        """Files whose path contains an exclude_pattern are skipped entirely."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a log file whose path contains "swe_team"
+            swe_dir = Path(tmpdir) / "swe_team"
+            swe_dir.mkdir()
+            log_file = swe_dir / "swe_team.log"
+            log_file.write_text(
+                "2025-01-01 10:00:00 ERROR Something broke\n"
+                "2025-01-01 10:01:00 CRITICAL Fatal error\n"
+            )
+            cfg = MonitorConfig(
+                enabled=True,
+                log_directories=[tmpdir],
+                exclude_patterns=["swe_team"],
+            )
+            agent = MonitorAgent(cfg)
+            tickets = agent.scan()
+            assert tickets == [], (
+                "Monitor must skip files matching exclude_patterns"
+            )
+
+    def test_scan_file_skips_swe_team_runner(self):
+        """swe_team_runner in the path is also excluded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner_dir = Path(tmpdir) / "swe_team_runner"
+            runner_dir.mkdir()
+            log_file = runner_dir / "runner.log"
+            log_file.write_text("ERROR crash in runner\n")
+            cfg = MonitorConfig(
+                enabled=True,
+                log_directories=[tmpdir],
+                exclude_patterns=["swe_team", "swe_team_runner"],
+            )
+            agent = MonitorAgent(cfg)
+            tickets = agent.scan()
+            assert tickets == []
+
+    def test_internal_log_lines_filtered(self):
+        """Lines containing internal SWE Squad markers are never ticketed."""
+        internal_lines = [
+            "2025-01-01 10:00:00 [INFO] ERROR in SWE Team triage output",
+            "2025-01-01 10:01:00 [WARNING] CRITICAL alert from Stability gate",
+            "2025-01-01 10:02:00 Triage complete — FAILED to classify",
+            "=== Cycle 42 === ERROR detected previously",
+            "2025-01-01 10:03:00 SWE Team CRITICAL re-triage noise",
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "app.log"
+            log_file.write_text("\n".join(internal_lines) + "\n")
+            cfg = MonitorConfig(
+                enabled=True,
+                log_directories=[tmpdir],
+                exclude_patterns=[],  # No path exclusion — test line filter
+            )
+            agent = MonitorAgent(cfg)
+            tickets = agent.scan()
+            assert tickets == [], (
+                f"Internal SWE lines should be filtered, got {len(tickets)} ticket(s)"
+            )
+
+    def test_real_errors_still_detected_alongside_noise(self):
+        """Legitimate errors are still picked up even when noise is present."""
+        lines = [
+            "2025-01-01 10:00:00 [INFO] ERROR in SWE Team triage output",
+            "2025-01-01 10:01:00 ERROR real database connection timeout",
+            "2025-01-01 10:02:00 CRITICAL disk full on /data",
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "app.log"
+            log_file.write_text("\n".join(lines) + "\n")
+            cfg = MonitorConfig(
+                enabled=True,
+                log_directories=[tmpdir],
+                exclude_patterns=[],  # No path exclusion
+            )
+            agent = MonitorAgent(cfg)
+            tickets = agent.scan()
+            assert len(tickets) == 2, (
+                f"Expected 2 real tickets, got {len(tickets)}"
+            )
+
+    def test_seeded_swe_team_log_produces_zero_tickets_across_cycles(self):
+        """Multiple scan cycles on a realistic swe_team.log yield zero tickets.
+
+        This is the end-to-end regression test: seed a file that looks
+        exactly like the monitor's own output and confirm no tickets are
+        created over 3 consecutive scans.
+        """
+        swe_log_content = (
+            "2025-06-01 08:00:00,123 [INFO] SWE Team cycle started\n"
+            "2025-06-01 08:00:01,456 [INFO] MonitorAgent scan complete: 0 new ticket(s) from 1 dir(s)\n"
+            "2025-06-01 08:00:02,789 [WARNING] Stability gate BLOCKED — 2 CRITICAL bugs open\n"
+            "2025-06-01 08:00:03,012 Triage complete: ERROR ticket abc123 assigned to browser_investigator\n"
+            "=== Cycle 7 === CRITICAL threshold breached, FAILED stability check\n"
+            "2025-06-01 08:00:04,345 [INFO] SWE Team cycle finished\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Put the log under a path containing "swe_team" (path guard)
+            swe_dir = Path(tmpdir) / "logs" / "swe_team"
+            swe_dir.mkdir(parents=True)
+            log_file = swe_dir / "swe_team.log"
+            log_file.write_text(swe_log_content)
+
+            cfg = MonitorConfig(
+                enabled=True,
+                log_directories=[tmpdir],
+                exclude_patterns=["swe_team", "swe_team_runner"],
+            )
+            agent = MonitorAgent(cfg)
+            for cycle in range(3):
+                tickets = agent.scan()
+                assert tickets == [], (
+                    f"Cycle {cycle}: expected 0 tickets from swe_team.log, "
+                    f"got {len(tickets)}"
+                )
+
+    def test_seeded_swe_team_log_line_filter_alone(self):
+        """Even without path exclusion, the line-level filter catches
+        SWE Squad internal lines in swe_team.log content."""
+        swe_log_content = (
+            "2025-06-01 08:00:00,123 [INFO] SWE Team cycle started\n"
+            "2025-06-01 08:00:02,789 [WARNING] Stability gate BLOCKED — 2 CRITICAL bugs\n"
+            "2025-06-01 08:00:03,012 Triage complete: ERROR ticket abc123\n"
+            "=== Cycle 7 === CRITICAL threshold breached, FAILED stability check\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Deliberately NOT under a "swe_team" path
+            log_file = Path(tmpdir) / "general.log"
+            log_file.write_text(swe_log_content)
+
+            cfg = MonitorConfig(
+                enabled=True,
+                log_directories=[tmpdir],
+                exclude_patterns=[],  # Path exclusion disabled
+            )
+            agent = MonitorAgent(cfg)
+            tickets = agent.scan()
+            assert tickets == [], (
+                f"Line-level filter should catch all SWE internal lines, "
+                f"got {len(tickets)} ticket(s)"
+            )
+
+    def test_exclude_patterns_default(self):
+        """MonitorConfig defaults include swe_team exclusion patterns."""
+        cfg = MonitorConfig()
+        assert "swe_team" in cfg.exclude_patterns
+        assert "swe_team_runner" in cfg.exclude_patterns
+
+    def test_exclude_patterns_roundtrip(self):
+        """exclude_patterns survives to_dict / from_dict round-trip."""
+        cfg = MonitorConfig(exclude_patterns=["swe_team", "custom_agent"])
+        d = cfg.to_dict()
+        assert "exclude_patterns" in d
+        cfg2 = MonitorConfig.from_dict(d)
+        assert cfg2.exclude_patterns == ["swe_team", "custom_agent"]
+
+    def test_fingerprint_strips_timestamps(self):
+        """Identical triage lines with different timestamps get the same fingerprint."""
+        line_a = "2025-06-01 08:00:00,123 ERROR connection reset"
+        line_b = "2026-03-17 14:22:33,999 ERROR connection reset"
+        fp_a = _fingerprint("/logs/app.log", line_a)
+        fp_b = _fingerprint("/logs/app.log", line_b)
+        assert fp_a == fp_b, "Timestamps should be stripped before fingerprinting"
 
 
 # ======================================================================
@@ -734,6 +911,459 @@ class TestTicketStore:
 
 
 # ======================================================================
+# Semantic Memory (Embeddings + Supabase pgvector)
+# ======================================================================
+
+class TestEmbeddings:
+    def test_extract_memory_facts_calls_base_llm(self):
+        ticket = SWETicket(
+            title="Timeout in scraper",
+            description="x",
+            source_module="scraper",
+            error_log="TimeoutError: request timed out",
+            investigation_report="Root cause was a missing retry around upstream transient failures.",
+            proposed_fix="Added bounded retries and exponential backoff.",
+        )
+        mock_client = type(
+            "Client",
+            (),
+            {
+                "chat": type(
+                    "Chat",
+                    (),
+                    {
+                        "completions": type(
+                            "Completions",
+                            (),
+                            {
+                                "create": lambda self, **_: type(
+                                    "Resp",
+                                    (),
+                                    {
+                                        "choices": [
+                                            type(
+                                                "Choice",
+                                                (),
+                                                {
+                                                    "message": type(
+                                                        "Message",
+                                                        (),
+                                                        {"content": "Root cause: upstream timeout"},
+                                                    )()
+                                                },
+                                            )()
+                                        ]
+                                    },
+                                )()
+                            },
+                        )()
+                    },
+                )()
+            },
+        )()
+        import types
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = None
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "BASE_LLM_API_URL": "http://api.ai-automate.me/v1/",
+                        "BASE_LLM_API_KEY": "k",
+                        "EXTRACTION_MODEL": "gemini-3-flash",
+                    },
+                ),
+                patch("openai.OpenAI", return_value=mock_client) as mock_openai,
+                patch("src.swe_team.embeddings.os.getenv", wraps=os.getenv) as wrapped_getenv,
+            ):
+                result = extract_memory_facts(ticket)
+        assert result == "Root cause: upstream timeout"
+        mock_openai.assert_called_once_with(
+            base_url="http://api.ai-automate.me/v1/",
+            api_key="k",
+        )
+        extraction_model_reads = [
+            call.args for call in wrapped_getenv.call_args_list if call.args and call.args[0] == "EXTRACTION_MODEL"
+        ]
+        assert extraction_model_reads
+
+    def test_extract_memory_facts_fallback_on_failure(self):
+        ticket = SWETicket(
+            title="Failure",
+            description="x",
+            source_module="worker",
+            error_log="Traceback...",
+            investigation_report="Investigated.",
+        )
+        import types
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = None
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            with (
+                patch.dict(os.environ, {"BASE_LLM_API_URL": "https://api.example", "BASE_LLM_API_KEY": "k"}),
+                patch("openai.OpenAI", side_effect=RuntimeError("boom")),
+            ):
+                result = extract_memory_facts(ticket)
+        assert result == _ticket_text(ticket)
+
+    def test_embed_ticket_success(self):
+        ticket = SWETicket(title="Embed me", description="x", error_log="Traceback")
+        mock_client = type(
+            "C",
+            (),
+            {
+                "embeddings": type(
+                    "E",
+                    (),
+                    {
+                        "create": lambda self, **_: type(
+                            "Resp",
+                            (),
+                            {"data": [type("D", (), {"embedding": [0.1, 0.2, 0.3]})()]},
+                        )()
+                    },
+                )()
+            },
+        )()
+        # Inject a fake openai module so patch target resolves even without the package
+        import types
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = None  # placeholder — will be patched
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            with (
+                patch.dict(os.environ, {"BASE_LLM_API_URL": "https://api.example", "BASE_LLM_API_KEY": "k"}),
+                patch("openai.OpenAI", return_value=mock_client),
+            ):
+                result = embed_ticket(ticket)
+        assert result == [0.1, 0.2, 0.3]
+
+    def test_embed_ticket_failure_is_non_fatal(self):
+        ticket = SWETicket(title="Embed me", description="x")
+        import types
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = None
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            with patch("openai.OpenAI", side_effect=RuntimeError("proxy down")):
+                result = embed_ticket(ticket)
+        assert result is None
+
+    def test_embed_ticket_returns_none_without_openai(self):
+        """When openai package is not installed, embed_ticket returns None gracefully."""
+        ticket = SWETicket(title="No openai", description="x")
+        with patch.dict("sys.modules", {"openai": None}):
+            result = embed_ticket(ticket)
+        assert result is None
+
+    def test_embed_ticket_uses_extracted_facts_when_report_present(self):
+        ticket = SWETicket(
+            title="Embed report",
+            description="x",
+            investigation_report="Detailed root cause",
+        )
+        mock_client = type(
+            "C",
+            (),
+            {
+                "embeddings": type(
+                    "E",
+                    (),
+                    {
+                        "create": lambda self, **_: type(
+                            "Resp",
+                            (),
+                            {"data": [type("D", (), {"embedding": [0.1, 0.2]})()]},
+                        )()
+                    },
+                )()
+            },
+        )()
+        import types
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = None
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            with (
+                patch.dict(os.environ, {"BASE_LLM_API_URL": "https://api.example", "BASE_LLM_API_KEY": "k"}),
+                patch("openai.OpenAI", return_value=mock_client),
+                patch("src.swe_team.embeddings.extract_memory_facts", return_value="structured fact") as mock_extract,
+            ):
+                result = embed_ticket(ticket)
+        assert result == [0.1, 0.2]
+        mock_extract.assert_called_once_with(ticket)
+
+
+class TestSupabaseSemanticMemory:
+    def test_store_embedding_uses_patch(self):
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        with patch.object(store, "_request", return_value=None) as mock_request:
+            store.store_embedding("t1", [1.0, 2.0])
+        mock_request.assert_called_once_with(
+            "PATCH",
+            "/swe_tickets",
+            params={"ticket_id": "eq.t1", "team_id": "eq.team-a"},
+            body={"embedding": "[1.0,2.0]"},
+        )
+
+    def test_find_similar_calls_rpc(self):
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        fake_rows = [{"ticket_id": "t2", "similarity": 0.91}]
+        with patch.object(store, "_request", return_value=fake_rows) as mock_request:
+            result = store.find_similar([0.5, 0.6], top_k=3, similarity_floor=0.8)
+        assert result == fake_rows
+        mock_request.assert_called_once_with(
+            "POST",
+            "/rpc/match_similar_tickets",
+            body={
+                "query_embedding": "[0.5,0.6]",
+                "team": "team-a",
+                "match_count": 3,
+                "similarity_floor": 0.8,
+                "max_age_days": 180,
+            },
+        )
+
+    def test_store_embedding_with_dedup_merges(self):
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        ticket = SWETicket(
+            title="New incident",
+            description="x",
+            investigation_report="new report with more details",
+            proposed_fix="new fix",
+        )
+        existing = SWETicket(
+            title="Existing incident",
+            description="x",
+            investigation_report="short",
+            proposed_fix="old fix",
+        )
+        existing.ticket_id = "existing-ticket"
+
+        with (
+            patch.object(store, "find_similar", return_value=[{"ticket_id": "existing-ticket", "similarity": 0.95}]),
+            patch.object(store, "get", return_value=existing),
+            patch.object(store, "_request", return_value=None) as mock_request,
+        ):
+            result = store.store_embedding_with_dedup(ticket, [1.0, 2.0], dedup_threshold=0.92)
+
+        assert result == "merged"
+        mock_request.assert_called_once_with(
+            "PATCH",
+            "/swe_tickets",
+            params={"ticket_id": "eq.existing-ticket", "team_id": "eq.team-a"},
+            body={
+                "investigation_report": "new report with more details",
+                "proposed_fix": "new fix",
+                "embedding": "[1.0,2.0]",
+            },
+        )
+
+    def test_store_embedding_with_dedup_stores_new(self):
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        ticket = SWETicket(title="Fresh incident", description="x", investigation_report="report")
+        with (
+            patch.object(store, "find_similar", return_value=[]),
+            patch.object(store, "store_embedding") as mock_store_embedding,
+        ):
+            result = store.store_embedding_with_dedup(ticket, [3.0, 4.0])
+        assert result == "stored"
+        mock_store_embedding.assert_called_once_with(ticket.ticket_id, [3.0, 4.0])
+
+    def test_record_memory_hit_calls_increment_rpc(self):
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        with patch.object(store, "_request", return_value=None) as mock_request:
+            store.record_memory_hit("t1")
+        mock_request.assert_called_once_with(
+            "POST",
+            "/rpc/increment_memory_confidence",
+            body={"p_ticket_id": "t1", "p_team": "team-a"},
+        )
+
+    def test_match_similar_tickets_rpc_includes_confidence(self):
+        schema = Path("scripts/ops/supabase_schema.sql").read_text()
+        assert "memory_confidence FLOAT DEFAULT 1.0" in schema
+        assert "memory_accessed_at TIMESTAMPTZ" in schema
+        assert "increment_memory_confidence" in schema
+        assert "max_age_days     INT     DEFAULT 180" in schema
+        assert "COALESCE(t.memory_confidence, 1.0) AS memory_confidence" in schema
+
+
+# ======================================================================
+# Supabase Keep-Alive
+# ======================================================================
+
+
+class TestSupabaseKeepAlive:
+    """Tests for SupabaseTicketStore.keep_alive() — prevents free-tier pause."""
+
+    def _make_store(self):
+        return SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+
+    def test_last_activity_updated_on_request(self):
+        """_last_activity should be refreshed after a successful _request()."""
+        from datetime import datetime, timedelta, timezone
+
+        store = self._make_store()
+        # Backdate the activity timestamp
+        old_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        store._last_activity = old_time
+
+        with patch.object(store, "_request", wraps=store._request):
+            # Simulate a successful request by mocking urlopen
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                mock_resp = mock_urlopen.return_value.__enter__.return_value
+                mock_resp.read.return_value = b"[]"
+                store._request("GET", "/swe_tickets", params={"limit": "1"})
+
+        assert store._last_activity > old_time
+        assert store._last_activity > datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+    def test_keep_alive_skips_when_recent_activity(self):
+        """keep_alive() returns False if last activity is within threshold."""
+        from datetime import datetime, timezone
+
+        store = self._make_store()
+        # Activity just happened (default in __init__)
+        store._last_activity = datetime.now(timezone.utc)
+
+        with patch.object(store, "_request") as mock_request:
+            result = store.keep_alive(threshold_days=5)
+
+        assert result is False
+        mock_request.assert_not_called()
+
+    def test_keep_alive_fires_when_activity_stale(self):
+        """keep_alive() sends a ping when activity is older than threshold."""
+        from datetime import datetime, timedelta, timezone
+
+        store = self._make_store()
+        store._last_activity = datetime.now(timezone.utc) - timedelta(days=6)
+
+        with patch.object(store, "_request", return_value=[]) as mock_request:
+            result = store.keep_alive(threshold_days=5)
+
+        assert result is True
+        mock_request.assert_called_once_with(
+            "GET",
+            "/swe_tickets",
+            params={"select": "ticket_id", "limit": "1"},
+        )
+
+    def test_keep_alive_handles_api_error_gracefully(self):
+        """keep_alive() returns False (not raises) when the API call fails."""
+        from datetime import datetime, timedelta, timezone
+
+        store = self._make_store()
+        store._last_activity = datetime.now(timezone.utc) - timedelta(days=10)
+
+        with patch.object(store, "_request", side_effect=urllib.error.URLError("timeout")):
+            result = store.keep_alive(threshold_days=5)
+
+        assert result is False
+
+    def test_keep_alive_custom_threshold(self):
+        """keep_alive() respects a custom threshold_days parameter."""
+        from datetime import datetime, timedelta, timezone
+
+        store = self._make_store()
+        # Activity 3 days ago — should skip with default (5) but fire with 2
+        store._last_activity = datetime.now(timezone.utc) - timedelta(days=3)
+
+        with patch.object(store, "_request", return_value=[]) as mock_request:
+            result_skip = store.keep_alive(threshold_days=5)
+        assert result_skip is False
+        mock_request.assert_not_called()
+
+        with patch.object(store, "_request", return_value=[]) as mock_request:
+            result_fire = store.keep_alive(threshold_days=2)
+        assert result_fire is True
+        mock_request.assert_called_once()
+
+    def test_last_activity_set_on_init(self):
+        """_last_activity should be set to approximately now on construction."""
+        from datetime import datetime, timedelta, timezone
+
+        before = datetime.now(timezone.utc)
+        store = self._make_store()
+        after = datetime.now(timezone.utc)
+
+        assert before <= store._last_activity <= after
+
+
+class TestRunnerKeepAlive:
+    """Tests for keep-alive integration in the SWE team runner."""
+
+    def test_run_cycle_calls_keep_alive_for_supabase_store(self):
+        """run_cycle() should call keep_alive() when store is SupabaseTicketStore."""
+        import scripts.ops.swe_team_runner as runner
+
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+
+        # We only need to verify keep_alive is called, then let preflight abort
+        with (
+            patch.object(store, "keep_alive", return_value=False) as mock_ka,
+            patch.object(runner, "PreflightCheck") as mock_preflight,
+        ):
+            mock_pf_inst = mock_preflight.return_value
+            mock_pf_result = mock_pf_inst.run.return_value
+            mock_pf_result.passed = False
+            mock_pf_result.failures = ["test abort"]
+            mock_pf_result.summary.return_value = "test abort"
+
+            # Mock the alert so it doesn't actually send
+            with patch.object(runner, "_send_preflight_alert"):
+                from src.swe_team.config import SWETeamConfig
+                config = SWETeamConfig()
+                runner.run_cycle(config, store, dry_run=True)
+
+            mock_ka.assert_called_once()
+
+    def test_keep_alive_flag_with_supabase_store(self):
+        """--keep-alive should call store.keep_alive() and exit."""
+        import scripts.ops.swe_team_runner as runner
+
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+
+        with patch.object(store, "keep_alive", return_value=True) as mock_ka:
+            # Simulate what main() does for --keep-alive
+            if isinstance(store, SupabaseTicketStore):
+                sent = store.keep_alive()
+            mock_ka.assert_called_once()
+            assert sent is True
+
+
+# ======================================================================
 # SWE_TEAM_ENABLED environment variable override
 # ======================================================================
 
@@ -1105,6 +1735,70 @@ class TestInvestigatorAgent:
 
         assert result is False
         mock_run.assert_not_called()
+
+    def test_prompt_includes_semantic_memory_when_hits_exist(self, tmp_path):
+        from src.swe_team.investigator import InvestigatorAgent
+
+        program = tmp_path / "investigate.md"
+        program.write_text("Error: {error_log}\nModule: {source_module}\n")
+        ticket = SWETicket(
+            title="Scraper crash",
+            description="boom",
+            severity=TicketSeverity.HIGH,
+            source_module="scraping",
+            error_log="Traceback: boom",
+        )
+        ticket.transition(TicketStatus.TRIAGED)
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        with (
+            patch("src.swe_team.investigator.embed_ticket", return_value=[0.1, 0.2]),
+            patch.object(
+                store,
+                "find_similar",
+                return_value=[
+                    {
+                        "ticket_id": "abc123",
+                        "title": "Previous timeout",
+                        "source_module": "scraping",
+                        "investigation_report": "Root cause: flaky upstream",
+                        "proposed_fix": "Added retry",
+                        "similarity": 0.91,
+                    }
+                ],
+            ),
+        ):
+            agent = InvestigatorAgent(program_path=program, store=store)
+            prompt = agent._build_prompt(ticket)
+        assert "## Semantic Memory — Similar Resolved Tickets" in prompt
+        assert "Previous timeout" in prompt
+
+    def test_prompt_unchanged_when_embedding_fails(self, tmp_path):
+        from src.swe_team.investigator import InvestigatorAgent
+
+        program = tmp_path / "investigate.md"
+        program.write_text("Error: {error_log}\nModule: {source_module}\n")
+        ticket = SWETicket(
+            title="Scraper crash",
+            description="boom",
+            severity=TicketSeverity.HIGH,
+            source_module="scraping",
+            error_log="Traceback: boom",
+        )
+        ticket.transition(TicketStatus.TRIAGED)
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        with patch("src.swe_team.investigator.embed_ticket", return_value=None):
+            agent = InvestigatorAgent(program_path=program, store=store)
+            prompt = agent._build_prompt(ticket)
+        assert "Semantic Memory" not in prompt
+        assert "Traceback: boom" in prompt
 
 
 class TestParseCost:
@@ -1512,3 +2206,943 @@ class TestFetchGithubTickets:
 
         assert len(tickets) == 1
         assert tickets[0].description == ""
+
+
+class TestRunnerSemanticMemory:
+    def test_store_ticket_embedding_calls_store_for_supabase(self):
+        import scripts.ops.swe_team_runner as runner
+
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        ticket = SWETicket(title="Bug", description="x", investigation_report="report")
+        with (
+            patch("scripts.ops.swe_team_runner.embed_ticket", return_value=[0.1, 0.2]),
+            patch.object(store, "store_embedding_with_dedup") as mock_store_embedding,
+        ):
+            runner.store_ticket_embedding(store, ticket, enabled=True)
+        mock_store_embedding.assert_called_once_with(ticket, [0.1, 0.2])
+
+    def test_store_ticket_embedding_noops_without_report(self):
+        import scripts.ops.swe_team_runner as runner
+
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+        ticket = SWETicket(title="Bug", description="x")
+        with patch.object(store, "store_embedding_with_dedup") as mock_store_embedding:
+            runner.store_ticket_embedding(store, ticket, enabled=True)
+        mock_store_embedding.assert_not_called()
+
+
+# ======================================================================
+# Regression Detection & Fix Confidence
+# ======================================================================
+
+class TestListRecentlyResolved:
+    """Tests for TicketStore.list_recently_resolved()."""
+
+    def test_returns_resolved_within_window(self, tmp_path):
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        from datetime import datetime, timezone
+
+        t1 = SWETicket(title="Bug A", description="x")
+        t1.transition(TicketStatus.RESOLVED)
+        store.add(t1)
+
+        t2 = SWETicket(title="Bug B", description="y")
+        t2.transition(TicketStatus.RESOLVED)
+        store.add(t2)
+
+        # An open ticket should NOT appear
+        t3 = SWETicket(title="Bug C", description="z")
+        store.add(t3)
+
+        result = store.list_recently_resolved(hours=24)
+        ids = {t.ticket_id for t in result}
+        assert t1.ticket_id in ids
+        assert t2.ticket_id in ids
+        assert t3.ticket_id not in ids
+
+    def test_excludes_old_resolved(self, tmp_path):
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        from datetime import datetime, timedelta, timezone
+
+        t = SWETicket(title="Old bug", description="x")
+        t.transition(TicketStatus.RESOLVED)
+        # Backdate updated_at to 48 hours ago
+        t.updated_at = (
+            datetime.now(timezone.utc) - timedelta(hours=48)
+        ).isoformat()
+        store.add(t)
+
+        result = store.list_recently_resolved(hours=24)
+        assert len(result) == 0
+
+    def test_empty_store_returns_empty(self, tmp_path):
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        result = store.list_recently_resolved(hours=24)
+        assert result == []
+
+
+class TestSeverityEscalation:
+    """Tests for severity escalation logic."""
+
+    def test_escalation_medium_to_high(self):
+        import scripts.ops.swe_team_runner as runner
+        assert runner.escalate_severity(TicketSeverity.MEDIUM) == TicketSeverity.HIGH
+
+    def test_escalation_high_to_critical(self):
+        import scripts.ops.swe_team_runner as runner
+        assert runner.escalate_severity(TicketSeverity.HIGH) == TicketSeverity.CRITICAL
+
+    def test_escalation_critical_stays_critical(self):
+        import scripts.ops.swe_team_runner as runner
+        assert runner.escalate_severity(TicketSeverity.CRITICAL) == TicketSeverity.CRITICAL
+
+    def test_escalation_low_to_medium(self):
+        import scripts.ops.swe_team_runner as runner
+        assert runner.escalate_severity(TicketSeverity.LOW) == TicketSeverity.MEDIUM
+
+
+class TestFixConfidence:
+    """Tests for compute_fix_confidence()."""
+
+    def test_no_regressions(self):
+        import scripts.ops.swe_team_runner as runner
+        assert runner.compute_fix_confidence(attempts=3, regressions=0) == 1.0
+
+    def test_all_regressions(self):
+        import scripts.ops.swe_team_runner as runner
+        assert runner.compute_fix_confidence(attempts=3, regressions=3) == 0.0
+
+    def test_partial_regressions(self):
+        import scripts.ops.swe_team_runner as runner
+        result = runner.compute_fix_confidence(attempts=4, regressions=2)
+        assert result == pytest.approx(0.5)
+
+    def test_zero_attempts_uses_one(self):
+        import scripts.ops.swe_team_runner as runner
+        # When attempts=0, max(0,1)=1 → 1 - (1/1) = 0.0
+        assert runner.compute_fix_confidence(attempts=0, regressions=1) == 0.0
+
+
+class TestCheckRegressions:
+    """Tests for the check_regressions() function."""
+
+    def test_regression_detected_creates_ticket(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        # Create a resolved parent ticket with a fingerprint
+        parent = SWETicket(
+            title="Original bug",
+            description="Something broke",
+            severity=TicketSeverity.MEDIUM,
+            source_module="scraping",
+            investigation_report="Root cause: config error",
+            proposed_fix="Fix the config",
+            metadata={"fingerprint": "abc123"},
+        )
+        parent.transition(TicketStatus.RESOLVED)
+        store.add(parent)
+
+        # Mock a monitor that finds the same fingerprint in fresh scan
+        config = SWETeamConfig(regression_window_hours=24)
+        mock_monitor = type("MockMonitor", (), {"_known": set(), "_config": MonitorConfig(enabled=True)})()
+
+        with patch(
+            "scripts.ops.swe_team_runner._fingerprint_in_recent_logs",
+            return_value=True,
+        ):
+            regressions = runner.check_regressions(config, store, mock_monitor)
+
+        assert len(regressions) == 1
+        reg = regressions[0]
+        assert reg.metadata["is_regression"] is True
+        assert reg.metadata["regression_of"] == parent.ticket_id
+        assert reg.severity == TicketSeverity.HIGH  # escalated from MEDIUM
+        assert "REGRESSION" in reg.title
+        assert reg.metadata["fix_confidence"]["regressions"] == 1
+        assert reg.metadata["fix_confidence"]["attempts"] == 2
+        assert reg.metadata["fix_confidence"]["confidence"] == pytest.approx(0.5)
+        assert reg.source_module == "scraping"
+        assert "Root cause: config error" in reg.description
+
+    def test_no_regression_when_fingerprint_not_in_logs(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        parent = SWETicket(
+            title="Fixed bug",
+            description="Was broken",
+            severity=TicketSeverity.HIGH,
+            metadata={"fingerprint": "def456"},
+        )
+        parent.transition(TicketStatus.RESOLVED)
+        store.add(parent)
+
+        config = SWETeamConfig(regression_window_hours=24)
+        mock_monitor = type("MockMonitor", (), {"_known": set(), "_config": MonitorConfig(enabled=True)})()
+
+        with patch(
+            "scripts.ops.swe_team_runner._fingerprint_in_recent_logs",
+            return_value=False,
+        ):
+            regressions = runner.check_regressions(config, store, mock_monitor)
+
+        assert len(regressions) == 0
+
+    def test_regression_inherits_parent_context(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        parent = SWETicket(
+            title="Database timeout",
+            description="DB pool exhaustion",
+            severity=TicketSeverity.HIGH,
+            source_module="database",
+            investigation_report="Connection leak in worker pool",
+            proposed_fix="Add connection timeout and pool recycling",
+            metadata={"fingerprint": "db-fp-001"},
+        )
+        parent.transition(TicketStatus.RESOLVED)
+        store.add(parent)
+
+        config = SWETeamConfig(regression_window_hours=24)
+        mock_monitor = type("MockMonitor", (), {"_known": set(), "_config": MonitorConfig(enabled=True)})()
+
+        with patch(
+            "scripts.ops.swe_team_runner._fingerprint_in_recent_logs",
+            return_value=True,
+        ):
+            regressions = runner.check_regressions(config, store, mock_monitor)
+
+        assert len(regressions) == 1
+        reg = regressions[0]
+        assert "Connection leak in worker pool" in reg.description
+        assert "Add connection timeout and pool recycling" in reg.description
+        assert reg.severity == TicketSeverity.CRITICAL  # HIGH -> CRITICAL
+
+    def test_hitl_fires_at_three_regressions(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        parent = SWETicket(
+            title="Stubborn bug",
+            description="Keeps coming back",
+            severity=TicketSeverity.HIGH,
+            metadata={
+                "fingerprint": "stubborn-fp",
+                "fix_confidence": {
+                    "attempts": 3,
+                    "regressions": 2,  # Will become 3 → triggers HITL
+                    "confidence": 0.33,
+                },
+            },
+        )
+        parent.transition(TicketStatus.RESOLVED)
+        store.add(parent)
+
+        config = SWETeamConfig(regression_window_hours=24)
+        mock_monitor = type("MockMonitor", (), {"_known": set(), "_config": MonitorConfig(enabled=True)})()
+
+        with (
+            patch(
+                "scripts.ops.swe_team_runner._fingerprint_in_recent_logs",
+                return_value=True,
+            ),
+            patch(
+                "scripts.ops.swe_team_runner.notify_regression_hitl",
+            ) as mock_hitl,
+        ):
+            regressions = runner.check_regressions(config, store, mock_monitor)
+
+        assert len(regressions) == 1
+        reg = regressions[0]
+        assert reg.metadata["fix_confidence"]["regressions"] == 3
+        mock_hitl.assert_called_once_with(reg)
+
+    def test_hitl_not_fired_below_three_regressions(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        parent = SWETicket(
+            title="Bug",
+            description="x",
+            severity=TicketSeverity.MEDIUM,
+            metadata={"fingerprint": "fp-below-3"},
+        )
+        parent.transition(TicketStatus.RESOLVED)
+        store.add(parent)
+
+        config = SWETeamConfig(regression_window_hours=24)
+        mock_monitor = type("MockMonitor", (), {"_known": set(), "_config": MonitorConfig(enabled=True)})()
+
+        with (
+            patch(
+                "scripts.ops.swe_team_runner._fingerprint_in_recent_logs",
+                return_value=True,
+            ),
+            patch(
+                "scripts.ops.swe_team_runner.notify_regression_hitl",
+            ) as mock_hitl,
+        ):
+            regressions = runner.check_regressions(config, store, mock_monitor)
+
+        assert len(regressions) == 1
+        assert regressions[0].metadata["fix_confidence"]["regressions"] == 1
+        mock_hitl.assert_not_called()
+
+    def test_empty_resolved_returns_empty(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        config = SWETeamConfig(regression_window_hours=24)
+        mock_monitor = type("MockMonitor", (), {"_known": set(), "_config": MonitorConfig(enabled=True)})()
+
+        regressions = runner.check_regressions(config, store, mock_monitor)
+        assert regressions == []
+
+
+class TestRegressionRouting:
+    """Tests for regression ticket routing to Opus."""
+
+    def test_regression_routes_to_opus(self):
+        """Regression tickets with is_regression=True should use Opus."""
+        investigator = InvestigatorAgent(timeout_seconds=5)
+        ticket = SWETicket(
+            title="[REGRESSION] Something broke",
+            description="Regressed",
+            severity=TicketSeverity.MEDIUM,
+            metadata={"is_regression": True},
+        )
+        model = investigator._select_model(ticket)
+        assert model == "opus"
+
+    def test_non_regression_medium_uses_sonnet(self):
+        """Normal MEDIUM tickets use sonnet."""
+        investigator = InvestigatorAgent(timeout_seconds=5)
+        ticket = SWETicket(
+            title="Normal bug",
+            description="x",
+            severity=TicketSeverity.MEDIUM,
+        )
+        model = investigator._select_model(ticket)
+        assert model == "sonnet"
+
+    def test_regression_context_in_prompt(self):
+        """Regression tickets include regression context in the prompt."""
+        ticket = SWETicket(
+            title="[REGRESSION] DB timeout",
+            description="Regressed",
+            severity=TicketSeverity.HIGH,
+            metadata={
+                "is_regression": True,
+                "regression_of": "parent-123",
+                "fix_confidence": {
+                    "attempts": 3,
+                    "regressions": 2,
+                    "confidence": 0.33,
+                },
+            },
+        )
+        context = InvestigatorAgent._build_regression_context(ticket)
+        assert "REGRESSION ALERT" in context
+        assert "parent-123" in context
+        assert "Fix attempts so far: 3" in context
+        assert "Times regressed: 2" in context
+
+
+class TestRegressionWindowConfig:
+    """Tests for regression_window_hours config."""
+
+    def test_default_regression_window(self):
+        config = SWETeamConfig()
+        assert config.regression_window_hours == 24
+
+    def test_custom_regression_window(self):
+        config = SWETeamConfig.from_dict({"regression_window_hours": 48})
+        assert config.regression_window_hours == 48
+
+    def test_regression_window_roundtrip(self):
+        config = SWETeamConfig(regression_window_hours=12)
+        d = config.to_dict()
+        assert d["regression_window_hours"] == 12
+        config2 = SWETeamConfig.from_dict(d)
+        assert config2.regression_window_hours == 12
+
+
+# ======================================================================
+# Status File Writing
+# ======================================================================
+
+class TestWriteStatus:
+    def test_write_status_creates_file(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        status_path = str(tmp_path / "status.json")
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        t = SWETicket(title="Open bug", description="x", severity=TicketSeverity.HIGH)
+        t.transition(TicketStatus.TRIAGED)
+        store.add(t)
+
+        runner.write_status(
+            status_path,
+            cycle_result={"gate_verdict": "pass"},
+            store=store,
+        )
+
+        assert Path(status_path).is_file()
+        data = json.loads(Path(status_path).read_text())
+        assert data["gate_verdict"] == "pass"
+        assert data["tickets_open"] == 1
+        assert data["tickets_investigating"] == 0
+        assert data["next_cycle"] is None  # no interval provided
+
+    def test_write_status_with_interval(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        status_path = str(tmp_path / "status.json")
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        runner.write_status(
+            status_path,
+            cycle_result={"gate_verdict": "warn"},
+            store=store,
+            interval_seconds=1800,
+        )
+
+        data = json.loads(Path(status_path).read_text())
+        assert data["gate_verdict"] == "warn"
+        assert data["next_cycle"] is not None
+        assert data["tickets_open"] == 0
+
+    def test_write_status_counts_investigating(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        status_path = str(tmp_path / "status.json")
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        t1 = SWETicket(title="A", description="x", severity=TicketSeverity.HIGH)
+        t1.transition(TicketStatus.INVESTIGATING)
+        store.add(t1)
+
+        t2 = SWETicket(title="B", description="y", severity=TicketSeverity.CRITICAL)
+        t2.transition(TicketStatus.INVESTIGATING)
+        store.add(t2)
+
+        t3 = SWETicket(title="C", description="z", severity=TicketSeverity.MEDIUM)
+        t3.transition(TicketStatus.TRIAGED)
+        store.add(t3)
+
+        runner.write_status(
+            status_path,
+            cycle_result={"gate_verdict": "block"},
+            store=store,
+        )
+
+        data = json.loads(Path(status_path).read_text())
+        assert data["tickets_open"] == 3
+        assert data["tickets_investigating"] == 2
+
+    def test_write_status_creates_parent_dirs(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        status_path = str(tmp_path / "deep" / "nested" / "status.json")
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        runner.write_status(
+            status_path,
+            cycle_result={"gate_verdict": "pass"},
+            store=store,
+        )
+
+        assert Path(status_path).is_file()
+
+
+# ======================================================================
+# Test-Only Mode
+# ======================================================================
+
+class TestTestOnlyMode:
+    def test_test_only_no_candidates(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        config = SWETeamConfig()
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        result = runner.run_test_only_cycle(config, store)
+        assert result["tested"] == 0
+        assert result["passed"] == 0
+        assert result["failed"] == 0
+
+    def test_test_only_runs_tests_on_in_development(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        config = SWETeamConfig()
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        t = SWETicket(
+            title="Fix bug",
+            description="broken",
+            severity=TicketSeverity.HIGH,
+            investigation_report="Root cause found",
+        )
+        t.transition(TicketStatus.IN_DEVELOPMENT)
+        store.add(t)
+
+        mock_result = type("R", (), {"returncode": 0, "stdout": "all passed", "stderr": ""})()
+        with patch("src.swe_team.developer.subprocess.run", return_value=mock_result):
+            result = runner.run_test_only_cycle(config, store)
+
+        assert result["tested"] == 1
+        assert result["passed"] == 1
+        assert result["failed"] == 0
+
+    def test_test_only_runs_tests_on_in_review(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        config = SWETeamConfig()
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        t = SWETicket(
+            title="Fix applied",
+            description="review pending",
+            severity=TicketSeverity.HIGH,
+            investigation_report="Found the issue",
+        )
+        t.transition(TicketStatus.IN_REVIEW)
+        store.add(t)
+
+        mock_result = type("R", (), {"returncode": 1, "stdout": "FAILED test_x", "stderr": ""})()
+        with patch("src.swe_team.developer.subprocess.run", return_value=mock_result):
+            result = runner.run_test_only_cycle(config, store)
+
+        assert result["tested"] == 1
+        assert result["passed"] == 0
+        assert result["failed"] == 1
+        # Verify test_results recorded on ticket
+        updated = store.get(t.ticket_id)
+        assert updated.test_results["status"] == "fail"
+
+    def test_test_only_handles_exceptions(self, tmp_path):
+        import scripts.ops.swe_team_runner as runner
+
+        config = SWETeamConfig()
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        t = SWETicket(
+            title="Fix bug",
+            description="broken",
+            severity=TicketSeverity.HIGH,
+            investigation_report="Root cause found",
+        )
+        t.transition(TicketStatus.IN_DEVELOPMENT)
+        store.add(t)
+
+        with patch("src.swe_team.developer.subprocess.run", side_effect=Exception("boom")):
+            result = runner.run_test_only_cycle(config, store)
+
+        assert result["tested"] == 1
+        assert result["passed"] == 0
+        assert result["failed"] == 1
+
+
+# ======================================================================
+# Daemon Signal Handling
+# ======================================================================
+
+class TestDaemonSignalHandling:
+    def test_daemon_stops_on_shutdown_event(self, tmp_path):
+        """Daemon exits when shutdown event is set (simulating SIGTERM)."""
+        import scripts.ops.swe_team_runner as runner
+
+        config = SWETeamConfig(enabled=True)
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        call_count = {"n": 0}
+
+        def mock_run_cycle(cfg, st, dry_run=False, creative=False):
+            call_count["n"] += 1
+            # Return a minimal result
+            return {"gate_verdict": "pass"}
+
+        # Patch daemon_loop's internals: make it run one cycle then stop
+        original_event_wait = threading.Event.wait
+
+        def patched_wait(self, timeout=None):
+            # After the first cycle, trigger shutdown
+            if call_count["n"] >= 1:
+                self.set()
+                return True
+            return original_event_wait(self, timeout=0)
+
+        with (
+            patch.object(runner, "run_cycle", side_effect=mock_run_cycle),
+            patch.object(threading.Event, "wait", patched_wait),
+        ):
+            runner.daemon_loop(
+                config,
+                store,
+                interval_seconds=1,
+                dry_run=True,
+                status_path=str(tmp_path / "status.json"),
+            )
+
+        assert call_count["n"] >= 1
+
+    def test_daemon_recovers_from_cycle_exception(self, tmp_path):
+        """Daemon continues running even when a cycle throws an exception."""
+        import scripts.ops.swe_team_runner as runner
+
+        config = SWETeamConfig(enabled=True)
+        store = TicketStore(str(tmp_path / "tickets.json"))
+
+        call_count = {"n": 0}
+
+        def mock_run_cycle(cfg, st, dry_run=False, creative=False):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("Simulated crash")
+            return {"gate_verdict": "pass"}
+
+        original_event_wait = threading.Event.wait
+
+        def patched_wait(self, timeout=None):
+            if call_count["n"] >= 2:
+                self.set()
+                return True
+            return original_event_wait(self, timeout=0)
+
+        with (
+            patch.object(runner, "run_cycle", side_effect=mock_run_cycle),
+            patch.object(threading.Event, "wait", patched_wait),
+        ):
+            runner.daemon_loop(
+                config,
+                store,
+                interval_seconds=1,
+                dry_run=True,
+                status_path=str(tmp_path / "status.json"),
+            )
+
+        # Must have run at least 2 cycles — crashed on first, recovered on second
+        assert call_count["n"] >= 2
+
+    def test_daemon_writes_status_each_cycle(self, tmp_path):
+        """Status file is written after each cycle in daemon mode."""
+        import scripts.ops.swe_team_runner as runner
+
+        config = SWETeamConfig(enabled=True)
+        store = TicketStore(str(tmp_path / "tickets.json"))
+        status_path = str(tmp_path / "status.json")
+
+        call_count = {"n": 0}
+
+        def mock_run_cycle(cfg, st, dry_run=False, creative=False):
+            call_count["n"] += 1
+            return {"gate_verdict": "pass"}
+
+        original_event_wait = threading.Event.wait
+
+        def patched_wait(self, timeout=None):
+            if call_count["n"] >= 1:
+                self.set()
+                return True
+            return original_event_wait(self, timeout=0)
+
+        with (
+            patch.object(runner, "run_cycle", side_effect=mock_run_cycle),
+            patch.object(threading.Event, "wait", patched_wait),
+        ):
+            runner.daemon_loop(
+                config,
+                store,
+                interval_seconds=60,
+                dry_run=True,
+                status_path=status_path,
+            )
+
+        assert Path(status_path).is_file()
+        data = json.loads(Path(status_path).read_text())
+        assert data["gate_verdict"] == "pass"
+        assert data["next_cycle"] is not None  # interval was provided
+
+    def test_daemon_interval_from_config(self):
+        """Runner derives daemon interval from config when --interval is omitted."""
+        config = SWETeamConfig(
+            enabled=True,
+            monitor=MonitorConfig(scan_interval_minutes=15),
+        )
+        # The formula in main(): max(60, int(config.monitor.scan_interval_minutes * 60))
+        expected = max(60, int(15 * 60))
+        assert expected == 900
+
+
+# ======================================================================
+# Developer Handoff Verification
+# ======================================================================
+
+class TestDeveloperHandoff:
+    def test_developer_reads_investigation_report(self, tmp_path):
+        """Verify the developer prompt includes the investigation report."""
+        program = tmp_path / "fix.md"
+        program.write_text(
+            "Ticket: {ticket_id}\nTitle: {title}\n"
+            "Severity: {severity}\nModule: {source_module}\n"
+            "Report:\n{investigation_report}\n"
+        )
+
+        ticket = SWETicket(
+            title="Crash in scraper",
+            description="boom",
+            severity=TicketSeverity.HIGH,
+            source_module="scraping",
+            investigation_report="Root cause: null pointer in parse_html()",
+        )
+        ticket.transition(TicketStatus.INVESTIGATION_COMPLETE)
+
+        dev = DeveloperAgent(
+            repo_root=tmp_path,
+            program_path=program,
+        )
+        prompt = dev._build_prompt(ticket)
+
+        assert prompt is not None
+        assert "Root cause: null pointer in parse_html()" in prompt
+        assert ticket.ticket_id in prompt
+
+    def test_developer_rejects_without_investigation(self, tmp_path):
+        """Developer agent should not proceed without investigation_report."""
+        ticket = SWETicket(
+            title="Some bug",
+            description="x",
+            severity=TicketSeverity.HIGH,
+        )
+        ticket.transition(TicketStatus.INVESTIGATION_COMPLETE)
+
+        dev = DeveloperAgent(repo_root=tmp_path)
+        assert dev._eligible(ticket) is False
+
+    def test_developer_eligible_with_report(self, tmp_path):
+        """Developer agent accepts ticket with investigation_report."""
+        ticket = SWETicket(
+            title="Some bug",
+            description="x",
+            severity=TicketSeverity.HIGH,
+            investigation_report="Found the issue",
+        )
+        ticket.transition(TicketStatus.INVESTIGATION_COMPLETE)
+
+        dev = DeveloperAgent(repo_root=tmp_path)
+        assert dev._eligible(ticket) is True
+
+
+# ======================================================================
+# Developer Test Execution Verification
+# ======================================================================
+
+class TestDeveloperTestExecution:
+    def test_run_tests_captures_pass(self, tmp_path):
+        """Developer agent correctly detects passing tests."""
+        mock_result = type("R", (), {"returncode": 0, "stdout": "5 passed", "stderr": ""})()
+        dev = DeveloperAgent(repo_root=tmp_path)
+
+        import time
+        deadline = time.monotonic() + 60
+        with patch("src.swe_team.developer.subprocess.run", return_value=mock_result):
+            ok, error = dev._run_tests(deadline)
+
+        assert ok is True
+        assert error == ""
+
+    def test_run_tests_captures_failure(self, tmp_path):
+        """Developer agent correctly captures test failure output."""
+        mock_result = type("R", (), {
+            "returncode": 1,
+            "stdout": "FAILED test_something - AssertionError",
+            "stderr": "",
+        })()
+        dev = DeveloperAgent(repo_root=tmp_path)
+
+        import time
+        deadline = time.monotonic() + 60
+        with patch("src.swe_team.developer.subprocess.run", return_value=mock_result):
+            ok, error = dev._run_tests(deadline)
+
+        assert ok is False
+        assert "FAILED" in error
+
+
+# ======================================================================
+# ModelProbe
+# ======================================================================
+
+class TestListAvailableModels:
+    """Unit tests for model_probe.list_available_models()."""
+
+    def test_returns_sorted_model_ids(self):
+        from src.swe_team.model_probe import list_available_models
+
+        fake_model = type("M", (), {"id": None})
+        m1, m2, m3 = fake_model(), fake_model(), fake_model()
+        m1.id = "zeta-model"
+        m2.id = "alpha-model"
+        m3.id = "bge-m3"
+
+        fake_list = type("L", (), {"data": [m1, m2, m3]})()
+        fake_client = type("C", (), {"models": type("MS", (), {"list": lambda self: fake_list})()})()
+
+        with patch("openai.OpenAI", return_value=fake_client):
+            result = list_available_models(api_url="http://fake/v1", api_key="key")
+
+        assert result == ["alpha-model", "bge-m3", "zeta-model"]
+
+    def test_returns_empty_on_missing_url(self):
+        from src.swe_team.model_probe import list_available_models
+
+        with patch.dict(os.environ, {}, clear=True):
+            result = list_available_models(api_url=None, api_key=None)
+
+        assert result == []
+
+    def test_returns_empty_on_exception(self):
+        from src.swe_team.model_probe import list_available_models
+
+        with patch("openai.OpenAI", side_effect=RuntimeError("timeout")):
+            result = list_available_models(api_url="http://fake/v1", api_key="key")
+
+        assert result == []
+
+
+class TestSelectModel:
+    """Unit tests for model_probe.select_model()."""
+
+    def test_returns_preferred_when_available(self):
+        from src.swe_team.model_probe import select_model
+
+        result = select_model("bge-m3", ["bge-m3", "qwen3:8b"], ["fallback-a"])
+        assert result == "bge-m3"
+
+    def test_falls_back_to_first_available_fallback(self):
+        from src.swe_team.model_probe import select_model
+
+        result = select_model(
+            "missing-model",
+            ["qwen3:8b", "gemini-3-flash"],
+            ["not-there", "qwen3:8b", "gemini-3-flash"],
+        )
+        assert result == "qwen3:8b"
+
+    def test_returns_preferred_when_no_fallback_matches(self):
+        """When neither preferred nor fallbacks are available, returns preferred so caller fails loudly."""
+        from src.swe_team.model_probe import select_model
+
+        result = select_model("missing-model", ["other-model"], ["also-missing"])
+        assert result == "missing-model"
+
+    def test_skips_unavailable_fallbacks(self):
+        from src.swe_team.model_probe import select_model
+
+        result = select_model(
+            "preferred",
+            ["gemini-3-flash"],
+            ["not-here-1", "not-here-2", "gemini-3-flash"],
+        )
+        assert result == "gemini-3-flash"
+
+
+class TestModelProbeValidateAndPatch:
+    """Unit tests for ModelProbe.validate_and_patch_env()."""
+
+    def test_patches_env_when_configured_model_unavailable(self):
+        from src.swe_team.model_probe import ModelProbe
+
+        probe = ModelProbe(api_url="http://fake/v1", api_key="key")
+        probe._available = ["mxbai-embed-large", "gemini-3-flash"]  # bge-m3 missing
+
+        with patch.dict(os.environ, {"EMBEDDING_MODEL": "bge-m3"}, clear=False):
+            patches = probe.validate_and_patch_env()
+            assert "EMBEDDING_MODEL" in patches
+            assert patches["EMBEDDING_MODEL"] == "mxbai-embed-large"
+            assert os.environ["EMBEDDING_MODEL"] == "mxbai-embed-large"
+
+    def test_no_patches_when_all_models_available(self):
+        from src.swe_team.model_probe import ModelProbe
+
+        probe = ModelProbe(api_url="http://fake/v1", api_key="key")
+        probe._available = ["bge-m3", "gemini-3-flash"]
+
+        with patch.dict(os.environ, {"EMBEDDING_MODEL": "bge-m3", "EXTRACTION_MODEL": "gemini-3-flash"}, clear=False):
+            patches = probe.validate_and_patch_env()
+
+        assert patches == {}
+
+    def test_returns_empty_when_proxy_unreachable(self):
+        from src.swe_team.model_probe import ModelProbe
+
+        probe = ModelProbe(api_url="http://fake/v1", api_key="key")
+        probe._available = []  # simulate unreachable proxy
+
+        patches = probe.validate_and_patch_env()
+        assert patches == {}
+
+    def test_check_passthrough_when_no_available(self):
+        """check() returns the requested model unchanged when proxy is unreachable."""
+        from src.swe_team.model_probe import ModelProbe
+
+        probe = ModelProbe(api_url="http://fake/v1", api_key="key")
+        probe._available = []
+
+        result = probe.check("bge-m3", ["fallback-a"], task="embedding")
+        assert result == "bge-m3"
+
+    def test_check_returns_fallback_when_preferred_missing(self):
+        from src.swe_team.model_probe import ModelProbe
+
+        probe = ModelProbe(api_url="http://fake/v1", api_key="key")
+        probe._available = ["mxbai-embed-large"]
+
+        result = probe.check("bge-m3", ["mxbai-embed-large", "nomic-embed-text"], task="embedding")
+        assert result == "mxbai-embed-large"
+
+
+class TestRunnerModelProbeIntegration:
+    """Verify ModelProbe.validate_and_patch_env() is called at cycle start."""
+
+    def test_run_cycle_calls_model_probe(self):
+        import scripts.ops.swe_team_runner as runner
+        from src.swe_team.config import SWETeamConfig
+        from src.swe_team.supabase_store import SupabaseTicketStore
+
+        store = SupabaseTicketStore(
+            supabase_url="https://example.supabase.co",
+            supabase_key="test-key",
+            team_id="team-a",
+        )
+
+        with (
+            patch.object(store, "keep_alive", return_value=False),
+            patch.object(runner, "ModelProbe") as mock_probe_cls,
+            patch.object(runner, "PreflightCheck") as mock_preflight,
+            patch.object(runner, "_send_preflight_alert"),
+        ):
+            # Abort at preflight so the cycle doesn't run further
+            mock_pf = mock_preflight.return_value
+            mock_pf.run.return_value.passed = False
+            mock_pf.run.return_value.failures = ["abort"]
+            mock_pf.run.return_value.summary.return_value = "abort"
+
+            mock_probe_inst = mock_probe_cls.return_value
+            mock_probe_inst.validate_and_patch_env.return_value = {}
+
+            runner.run_cycle(SWETeamConfig(), store, dry_run=True)
+
+        mock_probe_cls.assert_called_once()
+        mock_probe_inst.validate_and_patch_env.assert_called_once()

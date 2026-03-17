@@ -1,28 +1,15 @@
 <p align="center">
-  <img src="assets/swe_squad_banner.png" alt="SWE Squad Banner" width="100%">
+  <img src="https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/Claude_Code-CLI-blueviolet?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTEyIDJDNi40OCAyIDIgNi40OCAyIDEyczQuNDggMTAgMTAgMTAgMTAtNC40OCAxMC0xMFMxNy41MiAyIDEyIDJ6Ii8+PC9zdmc+" alt="Claude Code">
+  <img src="https://img.shields.io/badge/A2A-Protocol-orange" alt="A2A Protocol">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
+  <img src="https://img.shields.io/github/stars/ArtemisAI/SWE-Squad?style=social" alt="GitHub Stars">
 </p>
 
-<h1 align="center">🛡️ SWE Squad</h1>
+<h1 align="center">SWE Squad</h1>
 
 <p align="center">
-  <em>Autonomous Software Engineering Agents That Fix Bugs While You Sleep</em>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white&style=for-the-badge" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/Claude_Code-CLI-7C3AED?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTEyIDJDNi40OCAyIDIgNi40OCAyIDEyczQuNDggMTAgMTAgMTAgMTAtNC40OCAxMC0xMFMxNy41MiAyIDEyIDJ6Ii8+PC9zdmc+&style=for-the-badge" alt="Claude Code">
-  <img src="https://img.shields.io/badge/A2A-Protocol-F97316?style=for-the-badge" alt="A2A Protocol">
-  <img src="https://img.shields.io/badge/license-MIT-22C55E?style=for-the-badge" alt="MIT License">
-</p>
-
-<p align="center">
-  <a href="https://github.com/ArtemisAI/SWE-Squad/stargazers">
-    <img src="https://img.shields.io/github/stars/ArtemisAI/SWE-Squad?style=social" alt="GitHub Stars">
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/ArtemisAI/SWE-Squad/network/members">
-    <img src="https://img.shields.io/github/forks/ArtemisAI/SWE-Squad?style=social" alt="GitHub Forks">
-  </a>
+  <strong>Autonomous Software Engineering Agents That Fix Bugs While You Sleep</strong>
 </p>
 
 <p align="center">
@@ -36,68 +23,29 @@
   <a href="https://supabase.com">Supabase</a>
 </p>
 
-<br>
-
 ---
 
-## 🔍 Overview
+## Overview
 
 SWE Squad is a team of AI agents that autonomously monitors your production systems, detects issues, and fixes them — with human oversight at every critical decision point.
 
 Unlike single-agent coding tools, SWE Squad operates as a **coordinated team** where each agent has a specialized role, cost-optimized model routing keeps bills low, and a stability gate prevents regressions.
 
-### ✨ Key Features
+### Key Features
 
-<table>
-  <tr>
-    <td align="center" width="33%">
-      <h4>🧠 Semantic Memory</h4>
-      <p>pgvector embeddings with mem0-style fact extraction — agents remember how past bugs were solved</p>
-    </td>
-    <td align="center" width="33%">
-      <h4>🔗 A2A Protocol</h4>
-      <p>Agent-to-Agent communication across machines on LAN, Tailscale, or any network</p>
-    </td>
-    <td align="center" width="33%">
-      <h4>🔌 Multi-Provider</h4>
-      <p>Claude Code, Gemini CLI, OpenCode — any coding agent can plug into the squad</p>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <h4>🔎 Automated Detection</h4>
-      <p>Scans logs for errors with fingerprint-based deduplication</p>
-    </td>
-    <td align="center" width="33%">
-      <h4>💰 Smart Model Routing</h4>
-      <p>T1/T2/T3 cost tiers — Haiku for cheap tasks, Sonnet for fixes, Opus only when critical</p>
-    </td>
-    <td align="center" width="33%">
-      <h4>🔄 Keep/Discard Loop</h4>
-      <p>Every fix lives on a git branch; tests fail → auto-revert</p>
-    </td>
-  </tr>
-  <tr>
-    <td align="center" width="33%">
-      <h4>🚦 Ralph Wiggum Gate</h4>
-      <p>Stability-first governance: bugs must be fixed before features ship</p>
-    </td>
-    <td align="center" width="33%">
-      <h4>🔁 Closed-Loop Validation</h4>
-      <p>Post-fix regression monitoring — catches fixes that don't hold in production</p>
-    </td>
-    <td align="center" width="33%">
-      <h4>👥 Multi-Team Support</h4>
-      <p>Multiple squads share a Supabase backend without overlap</p>
-    </td>
-  </tr>
-</table>
-
-<br>
+- **Automated Error Detection** — Scans logs for errors with fingerprint-based deduplication
+- **Smart Model Routing** — Haiku for cheap tasks, Sonnet for routine fixes, Opus for critical orchestration only
+- **Keep/Discard Fix Loop** — Every fix lives on a git branch; tests fail = auto-revert
+- **Ralph Wiggum Gate** — Stability-first governance: bugs must be fixed before features ship
+- **Deterministic Replay** — Caches successful fixes by error fingerprint for zero-cost replay
+- **Semantic Memory** — pgvector embeddings surface similar past fixes at investigation time; mem0-style fact extraction; confidence-weighted retrieval with TTL
+- **Multi-Team Support** — Multiple squads share a Supabase backend without overlap
+- **A2A Protocol** — Inter-agent communication for cross-team coordination
+- **CLI Tools** — `swe-cli` for status, tickets, issues, and daily reports from terminal or cron
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
                     ┌─────────────────────────────────────┐
@@ -152,134 +100,7 @@ Unlike single-agent coding tools, SWE Squad operates as a **coordinated team** w
 
 ---
 
-## 🧠 Semantic Memory — How Agents Learn
-
-SWE Squad doesn't start from scratch every time. A **pgvector-backed semantic memory** system gives every investigator access to resolved tickets that are similar to the current problem — before it begins analysis.
-
-```
-New ticket arrives
-       │
-       ▼
-┌─────────────────────────────┐
-│  embed_ticket()             │  ← bge-m3 multilingual (1024 dims)
-│  via OpenAI-compatible API  │
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│  extract_memory_facts()     │  ← mem0-style: distil raw ticket into
-│  via cheap T3 model         │    compact structured facts before
-│  (gemini-3-flash)           │    embedding (root cause, fix, tags)
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│  match_similar_tickets()    │  ← pgvector cosine similarity search
-│  Supabase RPC               │    against resolved/closed tickets
-└──────────────┬──────────────┘
-               │
-               ▼
-┌─────────────────────────────┐
-│  Inject into agent prompt   │  ← "## Semantic Memory — Similar
-│  as structured context      │     Resolved Tickets"
-└─────────────────────────────┘
-```
-
-**Why this matters:**
-- **Avoids redundant investigation** — the agent sees how a similar error was resolved last time
-- **Reduces Opus escalation** — Sonnet can solve problems that previously required Opus, because it has the prior fix as context
-- **Cross-repo patterns** — a fix from Repo A informs an investigation in Repo B (same Supabase backend)
-- **Zero-cost for known issues** — if the similarity is high enough, the trajectory distiller replays the cached fix without any LLM call
-
-The memory system is **best-effort and non-fatal** — if the embedding API is down, the database is unreachable, or the model returns garbage, the agent proceeds without memory context. No single failure breaks the pipeline.
-
-### Memory Configuration
-
-```yaml
-# config/swe_team.yaml
-memory:
-  embedding_model: "bge-m3"       # Multilingual (EN/FR/ES), 1024 dimensions
-  embedding_dimensions: 1024
-  top_k: 5                        # Return top 5 similar tickets
-  similarity_floor: 0.75          # Minimum cosine similarity threshold
-  store_on_investigation_complete: true
-```
-
-```bash
-# .env — embedding API (any OpenAI-compatible endpoint)
-EMBEDDING_MODEL=bge-m3
-EMBEDDING_API_URL=https://your-llm-proxy.example.com/v1
-EMBEDDING_API_KEY=your_key
-```
-
----
-
-## 🔗 A2A Protocol — Agent-to-Agent Communication
-
-SWE Squad implements Google's [A2A (Agent-to-Agent) protocol](https://github.com/google/A2A) for cross-agent coordination across machines. This means squads running on **different VMs on the same network** (LAN, Tailscale, WireGuard, etc.) can discover each other, share tickets, and coordinate work.
-
-```
-┌─────────────────────────┐     A2A / JSON-RPC 2.0     ┌─────────────────────────┐
-│  VM-1 (webdev-1)        │◄────────────────────────────►│  VM-2 (worker-1)        │
-│                         │     over LAN / Tailscale     │                         │
-│  SWE Squad (team: alpha)│                              │  SWE Squad (team: beta) │
-│  └─ Claude Code CLI     │                              │  └─ Gemini CLI          │
-│  └─ Monitor Agent       │                              │  └─ Investigator Agent  │
-│  └─ Developer Agent     │                              │  └─ Tester Agent        │
-│                         │                              │                         │
-│  A2A Hub (:18790)       │                              │  A2A Client             │
-└─────────────────────────┘                              └─────────────────────────┘
-              │                                                     │
-              └──────────────────┬──────────────────────────────────┘
-                                 │
-                          ┌──────▼──────┐
-                          │  Supabase   │  ← shared ticket store
-                          │  (pgvector) │    both teams read/write
-                          └─────────────┘
-```
-
-### How it works
-
-1. Each SWE Squad exposes an **Agent Card** (A2A standard) describing its skills:
-   - `monitor_scan` — scan logs and emit tickets
-   - `triage_ticket` — classify and assign
-   - `investigate_ticket` — run Claude Code diagnosis
-   - `check_stability` — Ralph Wiggum gate check
-
-2. Other agents on the network can **discover** the squad via the A2A hub and **invoke** these skills via JSON-RPC messages.
-
-3. Events (issue detected, triage complete, investigation complete, fix deployed) are **dispatched** to the A2A hub for any listening agent to consume.
-
-### Use cases
-
-- **Distributed monitoring**: Squad on VM-1 monitors web services, squad on VM-2 monitors databases — both write to the same Supabase ticket store
-- **Cross-team escalation**: Alpha squad can't fix a database issue → dispatches an A2A event → Beta squad (database specialist) picks it up
-- **Heterogeneous agents**: Claude Code, Gemini CLI, and OpenCode agents coexist — each runs on its preferred VM but coordinates through A2A
-
----
-
-## 🔌 Multi-Provider Agent Support
-
-SWE Squad is designed to work with **any AI coding agent**, not just Claude Code. The architecture separates the **orchestration layer** (ticket management, routing, governance) from the **execution layer** (the actual coding agent).
-
-| Provider | How it integrates | Status |
-|----------|-------------------|--------|
-| **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** | Native — invoked via CLI subprocess with prompt programs | ✅ Production |
-| **[Gemini CLI](https://github.com/google-gemini/gemini-cli)** | Via A2A protocol — register as an agent, receive investigation/fix tasks | 🔌 Ready to integrate |
-| **[OpenCode](https://github.com/opencode-ai/opencode)** | Via A2A protocol — same as Gemini CLI | 🔌 Ready to integrate |
-| **[Aider](https://github.com/paul-gauthier/aider)** | CLI subprocess — similar to Claude Code integration | 🔌 Ready to integrate |
-| **[Goose](https://github.com/block/goose)** | CLI subprocess or A2A protocol | 🔌 Ready to integrate |
-| **Custom agents** | Implement the `AgentAdapter` interface or connect via A2A | 🔌 Extensible |
-
-### Adding a new agent provider
-
-1. **Via A2A (recommended)**: Your agent registers with the A2A hub, publishes its Agent Card, and responds to `handle_message()` calls with investigation reports or fix results.
-
-2. **Via CLI subprocess**: Add a new execution backend in the investigator/developer that calls your agent's CLI instead of `claude`. The prompt programs (`config/swe_team/programs/*.md`) are provider-agnostic markdown — they work with any agent that accepts text input.
-
----
-
-## 🔄 How the Fix Loop Works
+## How the Fix Loop Works
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -300,21 +121,21 @@ Each attempt runs on a **git branch**. Tests pass → commit. Tests fail → `gi
 
 ---
 
-## 🧠 Model Routing
+## Model Routing
 
 SWE Squad routes to the cheapest model that can handle the job:
 
 | Scenario | Model | Cost | Timeout |
 |----------|-------|------|---------|
-| Issue scanning, docs | **Haiku** | 💲 | 30s |
-| Routine HIGH bugs | **Sonnet** | 💲💲 | 2 min |
-| CRITICAL bugs | **Opus** | 💲💲💲 | 10 min |
-| After 2 failed Sonnet attempts | **Opus** | 💲💲💲 | 10 min |
-| Deterministic replay (cached) | **None** | 🆓 Free | < 1s |
+| Issue scanning, docs | **Haiku** | $ | 30s |
+| Routine HIGH bugs | **Sonnet** | $$ | 2 min |
+| CRITICAL bugs | **Opus** | $$$ | 10 min |
+| After 2 failed Sonnet attempts | **Opus** | $$$ | 10 min |
+| Deterministic replay (cached) | **None** | Free | < 1s |
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Clone & install
 
@@ -371,29 +192,32 @@ python -m pytest tests/unit/test_swe_team.py -v
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 ### Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `SWE_TEAM_ENABLED` | ✅ | Kill switch (`true`/`false`) |
-| `SWE_TEAM_ID` | ✅ | Unique team identifier for ticket scoping |
-| `SWE_GITHUB_ACCOUNT` | ✅ | Dedicated GitHub bot account for issue assignment |
-| `SWE_GITHUB_REPO` | ✅ | Target repository (`owner/repo`) |
-| `GH_TOKEN` | ✅ | GitHub PAT with `repo` scope |
-| `SWE_TEAM_CONFIG` | — | Path to `swe_team.yaml` (default: `config/swe_team.yaml`) |
-| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token for alerts |
-| `TELEGRAM_CHAT_ID` | — | Telegram chat ID for alerts |
-| `SUPABASE_URL` | — | Enables Supabase ticket store + semantic memory |
-| `SUPABASE_ANON_KEY` | — | Supabase authentication key |
-| `EMBEDDING_MODEL` | — | Embedding model (default: `bge-m3`) |
-| `EMBEDDING_API_URL` | — | OpenAI-compatible embedding endpoint (falls back to `BASE_LLM_API_URL`) |
-| `EMBEDDING_API_KEY` | — | API key for embeddings (falls back to `BASE_LLM_API_KEY`) |
-| `T1_MODEL` | — | Override for T1 heavy tier (default: `opus`) |
-| `T2_MODEL` | — | Override for T2 standard tier (default: `sonnet`) |
-| `T3_MODEL` | — | Override for T3 fast tier (default: `haiku`) |
-| `SWE_REMOTE_NODES` | — | JSON array of SSH worker nodes for log collection |
+| `SWE_TEAM_ENABLED` | Yes | Kill switch (`true`/`false`) |
+| `SWE_TEAM_ID` | Yes | Unique team identifier for ticket scoping |
+| `SWE_GITHUB_ACCOUNT` | Yes | Dedicated GitHub bot account for issue assignment |
+| `SWE_GITHUB_REPO` | Yes | Target repository (`owner/repo`) |
+| `GH_TOKEN` | Yes | GitHub PAT with `repo` scope |
+| `SWE_TEAM_CONFIG` | No | Path to `swe_team.yaml` (default: `config/swe_team.yaml`) |
+| `TELEGRAM_BOT_TOKEN` | No | Telegram bot token for alerts |
+| `TELEGRAM_CHAT_ID` | No | Telegram chat ID for alerts |
+| `SUPABASE_URL` | No | Enables Supabase ticket store |
+| `SUPABASE_ANON_KEY` | No | Supabase authentication key |
+| `BASE_LLM_API_URL` | No | External OpenAI-compatible proxy for embeddings and fact extraction |
+| `BASE_LLM_API_KEY` | No | API key for BASE_LLM proxy |
+| `EMBEDDING_MODEL` | No | Embedding model (default: `bge-m3`, 1024-dim) |
+| `EMBEDDING_API_URL` | No | Embeddings endpoint (defaults to `BASE_LLM_API_URL`) |
+| `EMBEDDING_API_KEY` | No | Embeddings key (defaults to `BASE_LLM_API_KEY`) |
+| `EXTRACTION_MODEL` | No | Fact-extraction model via BASE_LLM (default: `gemini-3-flash`) |
+| `SWE_MODEL_T1` | No | Override T1 model tier (default: `haiku`) |
+| `SWE_MODEL_T2` | No | Override T2 model tier (default: `sonnet`) |
+| `SWE_MODEL_T3` | No | Override T3 model tier (default: `opus`) |
+| `SWE_REMOTE_NODES` | No | JSON array of SSH worker nodes for log collection |
 
 ### YAML Config (`config/swe_team.yaml`)
 
@@ -401,14 +225,14 @@ Controls governance thresholds, monitoring patterns, and agent definitions. See 
 
 ---
 
-## 🗄️ Ticket Store
+## Ticket Store
 
 Two backends are available — the runner auto-selects based on environment variables:
 
 | Backend | When | Pros | Setup |
 |---------|------|------|-------|
-| **📁 JSON** | `SUPABASE_URL` not set | Zero deps, single file, works anywhere | Nothing — it's the default |
-| **☁️ Supabase** | `SUPABASE_URL` + `SUPABASE_ANON_KEY` set | Multi-agent, queryable, audit trail, real-time | Run `scripts/ops/supabase_schema.sql` |
+| **JSON** | `SUPABASE_URL` not set | Zero deps, single file, works anywhere | Nothing — it's the default |
+| **Supabase** | `SUPABASE_URL` + `SUPABASE_ANON_KEY` set | Multi-agent, queryable, audit trail, real-time | Run `scripts/ops/supabase_schema.sql` |
 
 ### Supabase Schema
 
@@ -417,13 +241,34 @@ psql $DATABASE_URL -f scripts/ops/supabase_schema.sql
 ```
 
 Creates:
-- `swe_tickets` — main work queue with team scoping
+- `swe_tickets` — main work queue with team scoping, embedding column, memory lifecycle fields
 - `swe_ticket_events` — immutable audit trail
 - Views: `v_backlog`, `v_queue_critical`, `v_queue_by_agent`, `v_stability`
+- RPCs: `match_similar_tickets`, `increment_memory_confidence`
 
 ---
 
-## 👥 Multi-Team Support
+## Semantic Memory
+
+SWE Squad learns from resolved tickets. When an investigator starts on a new ticket, it searches for the most similar resolved tickets and injects them as context — reducing time to diagnosis and preventing repeated investigations of the same class of bug.
+
+### How it works
+
+1. **Fact extraction** — when a ticket is resolved, `gemini-3-flash` (via BASE_LLM proxy) distils the investigation report into a compact structured fact: root cause, fix applied, affected module, and error/fix tags
+2. **Embedding** — the structured fact is embedded with `bge-m3` (1024-dim) and stored in Supabase pgvector
+3. **Deduplication** — before storing, a 0.92-threshold cosine check prevents near-duplicate memories; richer content wins on merge
+4. **Retrieval** — at investigation time, the top-5 most similar memories (≥0.75 cosine, ≤180 days old) are injected into the investigation prompt
+5. **Confidence** — each time a memory is used, its `memory_confidence` score increases (+0.1, max 2.0); confidence-weighted ranking surfaces proven memories over stale ones
+
+### Requirements
+
+- Supabase with pgvector extension (`CREATE EXTENSION IF NOT EXISTS vector`)
+- BASE_LLM proxy with `bge-m3` for embeddings and `gemini-3-flash` for extraction
+- Run `scripts/ops/supabase_schema.sql` to create the schema
+
+---
+
+## Multi-Team Support
 
 Multiple SWE Squads can operate independently on the same infrastructure:
 
@@ -442,58 +287,36 @@ Each squad:
 
 ---
 
-## 📦 Components
-
-### Agents
-
-| Module | Role | What it does |
-|--------|------|-------------|
-| `monitor_agent.py` | Sentinel | Scans logs for errors, deduplicates by fingerprint, creates tickets |
-| `triage_agent.py` | Dispatcher | Classifies severity, routes to specialist agents by module |
-| `investigator.py` | Diagnostician | Root cause analysis via Claude Code CLI with semantic memory context |
-| `developer.py` | Implementor | Keep/discard fix loop on git branches, 3-attempt escalation |
-| `creative_agent.py` | Optimizer | Analyzes resolved tickets, proposes preventive improvements |
-| `preflight.py` | Validator | Pre-flight checks (git identity, repo, env) before any agent executes |
-
-### Governance & Quality
-
-| Module | Role | What it does |
-|--------|------|-------------|
-| `ralph_wiggum.py` | Stability Gate | Blocks all work if open critical bugs exceed threshold |
-| `governance.py` | Deploy Governor | Validates fix complexity (max files, lines, module boundaries) |
-| `distiller.py` | Knowledge Cache | Caches successful fixes by fingerprint for zero-cost deterministic replay |
-
-### Memory & Storage
-
-| Module | Role | What it does |
-|--------|------|-------------|
-| `embeddings.py` | Memory Encoder | bge-m3 embeddings + mem0-style fact extraction via cheap T3 model |
-| `supabase_store.py` | Cloud Store | pgvector similarity search, audit trail, multi-team scoping (zero-dep) |
-| `ticket_store.py` | Local Store | JSON file-backed with fingerprint dedup — works offline, no setup |
-
-### Communication & Ops
-
-| Module | Role | What it does |
-|--------|------|-------------|
-| `telegram.py` | Alerting | Standalone Bot API client (stdlib only) — alerts, summaries, HITL escalation |
-| `notifier.py` | Notification Hub | Routes alerts: new tickets, gate blocks, regressions, daily/cycle reports |
-| `github_integration.py` | GitHub Bridge | Creates issues, comments with investigation reports and fix results |
-| `remote_logs.py` | Log Collector | SSH/rsync log aggregation from remote worker machines |
-| `a2a/adapters/swe_team.py` | A2A Adapter | Exposes squad skills via A2A protocol for cross-agent coordination |
-
-### Entry Points & Config
+## Components
 
 | File | Purpose |
 |------|---------|
-| `scripts/ops/swe_team_runner.py` | Main runner — cron, daemon, bootstrap, reports, keep-alive modes |
+| `src/swe_team/monitor_agent.py` | Log scanning, error detection, fingerprint dedup |
+| `src/swe_team/triage_agent.py` | Severity routing, specialist assignment |
+| `src/swe_team/investigator.py` | Claude Code CLI diagnosis; semantic memory context injection; model routing |
+| `src/swe_team/developer.py` | Keep/discard fix loop with git branches; preflight validation |
+| `src/swe_team/ralph_wiggum.py` | Stability gate — bugs before features |
+| `src/swe_team/governance.py` | Deployment governor, complexity limits |
+| `src/swe_team/creative_agent.py` | Proactive improvement proposals (only when stable) |
+| `src/swe_team/distiller.py` | Trajectory distillation — cache successful fixes for zero-cost replay |
+| `src/swe_team/embeddings.py` | bge-m3 embeddings + mem0-style fact extraction via BASE_LLM proxy |
+| `src/swe_team/supabase_store.py` | Supabase ticket store; semantic dedup; memory confidence lifecycle |
+| `src/swe_team/ticket_store.py` | JSON ticket store — zero-dependency default |
+| `src/swe_team/telegram.py` | Standalone Telegram Bot API client (stdlib only) |
+| `src/swe_team/notifier.py` | Telegram alerts, HITL escalation, daily summaries |
+| `src/swe_team/preflight.py` | PreflightCheck — validates environment before agent commits |
+| `src/swe_team/github_integration.py` | GitHub issue creation and commenting (repo-aware) |
+| `src/swe_team/remote_logs.py` | SSH/rsync log collection from workers |
+| `src/a2a/adapters/swe_team.py` | A2A protocol adapter for inter-agent events |
+| `scripts/ops/swe_team_runner.py` | Main entry point — cron, daemon, bootstrap, report modes |
 | `scripts/ops/swe_cli.py` | CLI tool — status, tickets, issues, repos, summary, report |
-| `scripts/ops/supabase_schema.sql` | Database schema + pgvector migration |
-| `config/swe_team.yaml` | Governance thresholds, model tiers, memory, agent definitions |
-| `config/swe_team/programs/` | Markdown prompt programs (investigate, fix, orchestrate) |
+| `scripts/ops/supabase_schema.sql` | Full Supabase DDL: tables, indexes, RLS, pgvector RPCs |
+| `config/swe_team/programs/` | Prompt programs: `investigate.md`, `fix.md`, `orchestrate.md` |
+| `crontab.example` | Recommended cron schedules for continuous monitoring and reports |
 
 ---
 
-## 📋 Requirements
+## Requirements
 
 - **Python 3.10+**
 - **[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)** — the AI backbone
@@ -504,7 +327,7 @@ Each squad:
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
@@ -521,39 +344,37 @@ python -m pytest tests/unit/test_swe_team.py -v
 
 ### Areas We'd Love Help With
 
-- 🔌 Additional ticket store backends (Redis, SQLite, PostgreSQL direct)
-- ⚙️ CI/CD pipeline integration (GitHub Actions, GitLab CI)
-- 📊 Web dashboard for ticket monitoring
-- 💬 Additional notification channels (Slack, Discord, email)
-- 🧪 Agent prompt optimization and benchmarking
-- 📖 Documentation and tutorials
+- Additional ticket store backends (Redis, SQLite, PostgreSQL direct)
+- CI/CD pipeline integration (GitHub Actions, GitLab CI)
+- Web dashboard for ticket monitoring
+- Additional notification channels (Slack, Discord, email)
+- Agent prompt optimization and benchmarking
+- Documentation and tutorials
 
 ---
 
-## 🗺️ Roadmap
+## Roadmap
 
-| Status | Feature |
-|--------|---------|
-| ✅ | Core agent loop (monitor → triage → investigate → fix → validate) |
-| ✅ | pgvector semantic memory with mem0-style fact extraction |
-| ✅ | A2A protocol adapter for cross-machine agent coordination |
-| ✅ | Ralph Wiggum stability gate |
-| ✅ | Closed-loop regression detection and fix confidence scoring |
-| ✅ | Trajectory distillation (cached fixes) |
-| ✅ | Supabase ticket store with multi-team scoping |
-| ✅ | T1/T2/T3 configurable model cost tiers |
-| ✅ | Pre-flight validation gate (context checks before execution) |
-| ✅ | Telegram notifications, cron reports, CLI tools |
-| ✅ | Session progress logs and heartbeat stall detection |
-| 🔲 | Gemini CLI / OpenCode direct integration |
-| 🔲 | Web dashboard for ticket monitoring |
-| 🔲 | GitHub Actions CI/CD integration |
-| 🔲 | Slack/Discord notifications |
-| 🔲 | Metrics and observability (Prometheus/Grafana) |
+- [x] Core agent loop (monitor → triage → investigate → fix)
+- [x] Ralph Wiggum stability gate
+- [x] Trajectory distillation (cached fixes, zero-cost replay)
+- [x] Supabase ticket store with multi-team support and audit trail
+- [x] A2A protocol adapter
+- [x] Semantic memory — pgvector embeddings + mem0-style extraction + confidence lifecycle
+- [x] Monitor self-scan recursion prevention
+- [x] Preflight validation gate
+- [x] Closed-loop regression detection and re-investigation
+- [x] CLI tools (`swe-cli`) for status, tickets, and reports
+- [x] Cron integration
+- [ ] Web dashboard for ticket monitoring
+- [ ] GitHub Actions integration
+- [ ] Slack/Discord notifications
+- [ ] Custom agent plugin system
+- [ ] Metrics and observability (Prometheus/Grafana)
 
 ---
 
-## 💖 Support & Sponsoring
+## Support & Sponsoring
 
 If SWE Squad is useful to your team, consider supporting the project:
 
@@ -563,21 +384,15 @@ If SWE Squad is useful to your team, consider supporting the project:
   </a>
 </p>
 
-- ⭐ **Star** this repo to help others discover it
-- 🐛 **Report issues** — bug reports and feature requests are valuable contributions
-- 📣 **Share** with your team — the more users, the better the project gets
-- 🤝 **Contribute** — PRs are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Star** this repo to help others discover it
+- **Report issues** — bug reports and feature requests are valuable contributions
+- **Share** with your team — the more users, the better the project gets
+- **Contribute** — PRs are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 For enterprise support or custom deployments, reach out via [GitHub Discussions](https://github.com/ArtemisAI/SWE-Squad/discussions).
 
 ---
 
-## 📄 License
+## License
 
 [MIT](LICENSE) — use it, fork it, build on it.
-
----
-
-<p align="center">
-  <sub>Made with ❤️ by <a href="https://github.com/ArtemisAI">ArtemisAI</a></sub>
-</p>

@@ -83,6 +83,9 @@ class MonitorConfig:
             "FAILED",
         ]
     )
+    exclude_patterns: List[str] = field(
+        default_factory=lambda: ["swe_team", "swe_team_runner"]
+    )
     scan_interval_minutes: int = 30
     dedup_window_hours: int = 24    # Avoid re-filing the same issue
     enabled: bool = False
@@ -94,6 +97,9 @@ class MonitorConfig:
             log_patterns=data.get(
                 "log_patterns", ["ERROR", "CRITICAL", "Traceback", "FAILED"]
             ),
+            exclude_patterns=data.get(
+                "exclude_patterns", ["swe_team", "swe_team_runner"]
+            ),
             scan_interval_minutes=data.get("scan_interval_minutes", 30),
             dedup_window_hours=data.get("dedup_window_hours", 24),
             enabled=data.get("enabled", False),
@@ -103,9 +109,95 @@ class MonitorConfig:
         return {
             "log_directories": self.log_directories,
             "log_patterns": self.log_patterns,
+            "exclude_patterns": self.exclude_patterns,
             "scan_interval_minutes": self.scan_interval_minutes,
             "dedup_window_hours": self.dedup_window_hours,
             "enabled": self.enabled,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Model cost tiers
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModelConfig:
+    """Model cost tiers for SWE agent operations.
+
+    Three tiers allow cost-conscious routing:
+      - t1_heavy: Architecture, orchestration, critical bugs (e.g. Opus)
+      - t2_standard: Feature implementation, routine fixes (e.g. Sonnet)
+      - t3_fast: Docs, scanning, simple tasks (e.g. Haiku)
+
+    Environment variable overrides: T1_MODEL, T2_MODEL, T3_MODEL
+    """
+
+    t1_heavy: str = "opus"
+    t2_standard: str = "sonnet"
+    t3_fast: str = "haiku"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ModelConfig":
+        return cls(
+            t1_heavy=data.get("t1_heavy", "opus"),
+            t2_standard=data.get("t2_standard", "sonnet"),
+            t3_fast=data.get("t3_fast", "haiku"),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "t1_heavy": self.t1_heavy,
+            "t2_standard": self.t2_standard,
+            "t3_fast": self.t3_fast,
+        }
+
+    def apply_env_overrides(self) -> None:
+        """Apply environment variable overrides for model tiers."""
+        env_t1 = os.environ.get("T1_MODEL")
+        if env_t1:
+            self.t1_heavy = env_t1
+        env_t2 = os.environ.get("T2_MODEL")
+        if env_t2:
+            self.t2_standard = env_t2
+        env_t3 = os.environ.get("T3_MODEL")
+        if env_t3:
+            self.t3_fast = env_t3
+
+
+# ---------------------------------------------------------------------------
+# Semantic memory settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MemoryConfig:
+    """Settings for semantic ticket memory (pgvector embeddings)."""
+
+    embedding_model: str = "bge-m3"
+    embedding_dimensions: int = 1024
+    top_k: int = 5
+    similarity_floor: float = 0.75
+    store_on_investigation_complete: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "MemoryConfig":
+        return cls(
+            embedding_model=data.get("embedding_model", "bge-m3"),
+            embedding_dimensions=data.get("embedding_dimensions", 1024),
+            top_k=data.get("top_k", 5),
+            similarity_floor=data.get("similarity_floor", 0.75),
+            store_on_investigation_complete=data.get(
+                "store_on_investigation_complete",
+                True,
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "embedding_model": self.embedding_model,
+            "embedding_dimensions": self.embedding_dimensions,
+            "top_k": self.top_k,
+            "similarity_floor": self.similarity_floor,
+            "store_on_investigation_complete": self.store_on_investigation_complete,
         }
 
 
@@ -120,11 +212,14 @@ class SWETeamConfig:
     agents: List[SWEAgentConfig] = field(default_factory=list)
     governance: GovernanceConfig = field(default_factory=GovernanceConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    models: ModelConfig = field(default_factory=ModelConfig)
     ticket_store_path: str = "data/swe_team/tickets.json"
     a2a_hub_url: str = "http://localhost:18790"
     enabled: bool = False
     team_id: str = "default"
     github_account: str = ""
+    regression_window_hours: int = 24
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SWETeamConfig":
@@ -133,10 +228,14 @@ class SWETeamConfig:
         ]
         gov = GovernanceConfig.from_dict(data.get("governance", {}))
         mon = MonitorConfig.from_dict(data.get("monitor", {}))
+        memory = MemoryConfig.from_dict(data.get("memory", {}))
+        models = ModelConfig.from_dict(data.get("models", {}))
         return cls(
             agents=agents,
             governance=gov,
             monitor=mon,
+            memory=memory,
+            models=models,
             ticket_store_path=data.get(
                 "ticket_store_path", "data/swe_team/tickets.json"
             ),
@@ -144,6 +243,7 @@ class SWETeamConfig:
             enabled=data.get("enabled", False),
             team_id=data.get("team_id", "default"),
             github_account=data.get("github_account", ""),
+            regression_window_hours=data.get("regression_window_hours", 24),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -151,11 +251,14 @@ class SWETeamConfig:
             "agents": [a.to_dict() for a in self.agents],
             "governance": self.governance.to_dict(),
             "monitor": self.monitor.to_dict(),
+            "memory": self.memory.to_dict(),
+            "models": self.models.to_dict(),
             "ticket_store_path": self.ticket_store_path,
             "a2a_hub_url": self.a2a_hub_url,
             "enabled": self.enabled,
             "team_id": self.team_id,
             "github_account": self.github_account,
+            "regression_window_hours": self.regression_window_hours,
         }
 
     def get_agents_by_role(self, role: AgentRole) -> List[SWEAgentConfig]:
@@ -197,5 +300,8 @@ def load_config(path: Optional[str] = None) -> SWETeamConfig:
     if env_gh_account:
         config.github_account = env_gh_account
         logger.info("SWE_GITHUB_ACCOUNT=%s", env_gh_account)
+
+    # Apply model tier env overrides (T1_MODEL, T2_MODEL, T3_MODEL)
+    config.models.apply_env_overrides()
 
     return config

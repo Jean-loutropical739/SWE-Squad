@@ -7,7 +7,6 @@ and only keep changes that pass tests and complexity gates.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import subprocess
 import time
@@ -17,6 +16,7 @@ from typing import List, Optional, Tuple, Union
 
 from src.swe_team.governance import check_fix_complexity
 from src.swe_team.models import SWETicket, TicketStatus
+from src.swe_team.preflight import PreflightCheck
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ class DeveloperAgent:
         claude_path: str = _DEFAULT_CLAUDE_PATH,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
         test_command: Optional[List[str]] = None,
+        model_config: Optional[object] = None,
     ) -> None:
         self._repo_root = Path(repo_root)
         self._program_path = Path(program_path)
@@ -49,13 +50,27 @@ class DeveloperAgent:
         self._max_attempts = max_attempts
         self._program_cache: Optional[str] = None
         self._test_command = test_command or self._default_test_command()
+        self._model_config = model_config
 
     def attempt_fix(self, ticket: SWETicket) -> bool:
         """Run the keep/discard loop for *ticket*."""
+        # Preflight: validate execution context before doing any work
+        preflight_result = self._run_preflight()
+        if not preflight_result.passed:
+            logger.warning(
+                "Preflight FAILED for ticket %s: %s",
+                ticket.ticket_id,
+                preflight_result.summary(),
+            )
+            ticket.metadata["preflight_failure"] = preflight_result.failures
+            ticket.metadata["blocked_reason"] = preflight_result.summary()
+            return False
+
         if not self._eligible(ticket):
             return False
 
         ticket.transition(TicketStatus.IN_DEVELOPMENT)
+        ticket.metadata["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
         branch = self._ensure_branch(ticket)
         ticket.metadata["branch"] = branch
         ticket.metadata.setdefault("pr_number", None)
@@ -158,6 +173,18 @@ class DeveloperAgent:
     # Internals
     # ------------------------------------------------------------------
 
+    def _run_preflight(self):
+        """Run pre-flight validation before attempting a fix."""
+        import os
+        preflight = PreflightCheck(
+            expected_git_name=os.environ.get("SWE_EXPECTED_GIT_NAME"),
+            expected_git_email=os.environ.get("SWE_EXPECTED_GIT_EMAIL"),
+            expected_github_account=os.environ.get("SWE_GITHUB_ACCOUNT") or None,
+            expected_repo_root=self._repo_root if os.environ.get("SWE_GITHUB_REPO") else None,
+            required_env_vars=["SWE_TEAM_ID", "SWE_GITHUB_REPO"],
+        )
+        return preflight.run()
+
     def _eligible(self, ticket: SWETicket) -> bool:
         if not ticket.investigation_report:
             return False
@@ -210,15 +237,17 @@ class DeveloperAgent:
         return self._program_cache
 
     def _select_model(self, ticket: SWETicket) -> str:
-        """Opus for CRITICAL or after 2+ failed attempts, sonnet otherwise."""
+        """Select model from config tiers: t1_heavy for CRITICAL or escalation, t2_standard otherwise."""
         from src.swe_team.models import TicketSeverity
+        heavy = self._model_config.t1_heavy if self._model_config else "opus"
+        standard = self._model_config.t2_standard if self._model_config else "sonnet"
         if ticket.severity == TicketSeverity.CRITICAL:
-            return "opus"
+            return heavy
         attempts = ticket.metadata.get("attempts", [])
         failed = sum(1 for a in attempts if a.get("result") == "fail")
         if failed >= 2:
-            return "opus"  # Escalate after 2 failures
-        return "sonnet"
+            return heavy  # Escalate after 2 failures
+        return standard
 
     def _run_claude(self, prompt: str, *, timeout: int, model: str = "sonnet") -> None:
         # Developer agent needs full tool access (Edit, Write, Bash) to make fixes.
@@ -344,27 +373,9 @@ class DeveloperAgent:
 
     @staticmethod
     def _send_telegram(message: str) -> None:
-        from src.notifications.telegram import send_telegram_alert
+        from src.swe_team.telegram import send_message
 
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            try:
-                asyncio.run(send_telegram_alert(message, parse_mode="HTML"))
-            except Exception:
-                logger.exception("Failed to send developer escalation via asyncio.run")
-        else:
-            task = loop.create_task(send_telegram_alert(message, parse_mode="HTML"))
-            task.add_done_callback(_handle_telegram_task_result)
-
-
-def _handle_telegram_task_result(task: asyncio.Task[None]) -> None:
-    """Log exceptions from async Telegram escalation tasks."""
-    try:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc:
-            logger.exception("Developer escalation task failed: %s", exc)
-    except Exception:
-        logger.exception("Failed to inspect developer escalation task")
+            send_message(message, parse_mode="HTML")
+        except Exception:
+            logger.exception("Failed to send developer escalation")
