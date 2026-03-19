@@ -13,7 +13,6 @@ Format: SWE-SQUAD-{TYPE}-{ID}
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -30,10 +29,10 @@ def make_session_tag(
 
     Priority: issue_number > ticket_id > cycle timestamp.
     """
-    trace = str(uuid.uuid4())[:8]
+    trace = str(uuid.uuid4())[:12]
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M")
 
-    if issue_number:
+    if issue_number is not None:
         tag = f"SWE-SQUAD-ISSUE#{issue_number}"
     elif ticket_id:
         tag = f"SWE-SQUAD-TICKET-{ticket_id[:12]}"
@@ -45,11 +44,12 @@ def make_session_tag(
     return f"{tag} [trace:{trace}]"
 
 
-def session_header(tag: str) -> str:
+def session_header(tag: str, started_at: Optional[datetime] = None) -> str:
     """Format a session header for GitHub comments and log entries."""
+    ts = started_at if started_at is not None else datetime.now(timezone.utc)
     return (
         f"**Session:** `{tag}`\n"
-        f"**Started:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"**Started:** {ts.strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"**Agent:** SWE-Squad (Claude Code)\n"
     )
 
