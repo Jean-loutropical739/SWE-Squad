@@ -63,13 +63,26 @@ class TestParseCronField(unittest.TestCase):
         # */2 on months (1-12)
         self.assertEqual(parse_cron_field("*/2", 1, 12), [1, 3, 5, 7, 9, 11])
 
+    def test_step_zero_raises(self):
+        with self.assertRaises(ValueError):
+            parse_cron_field("*/0", 0, 59)
+
+    def test_non_integer_raises(self):
+        with self.assertRaises(ValueError):
+            parse_cron_field("abc", 0, 59)
+
+    def test_range_clamped_to_bounds(self):
+        # Range 0-30 clamped to [1, 12] for months -> [1..12]
+        result = parse_cron_field("0-30", 1, 12)
+        self.assertEqual(result, list(range(1, 13)))
+
 
 # ---------------------------------------------------------------------------
 # 2. cron_matches
 # ---------------------------------------------------------------------------
 class TestCronMatches(unittest.TestCase):
     def _dt(self, minute=0, hour=0, day=1, month=1, year=2026):
-        # weekday: Jan 1, 2026 = Thursday (3)
+        # weekday: Jan 1, 2026 = Thursday (Python weekday 3)
         return datetime(year, month, day, hour, minute, tzinfo=timezone.utc)
 
     def test_every_minute(self):
@@ -84,9 +97,23 @@ class TestCronMatches(unittest.TestCase):
         self.assertFalse(cron_matches("0 12 * * *", self._dt(minute=0, hour=11)))
 
     def test_day_of_week(self):
-        # Jan 1, 2026 = Thursday = weekday 3
-        self.assertTrue(cron_matches("0 0 * * 3", self._dt()))
-        self.assertFalse(cron_matches("0 0 * * 1", self._dt()))
+        # Jan 1, 2026 = Thursday = Python weekday 3 = cron DOW 4
+        self.assertTrue(cron_matches("0 0 * * 4", self._dt()))
+        self.assertFalse(cron_matches("0 0 * * 2", self._dt()))
+
+    def test_day_of_week_sunday(self):
+        # Jan 4, 2026 = Sunday = Python weekday 6
+        # In cron convention Sunday = cron 0 (or 7)
+        dt_sun = datetime(2026, 1, 4, 0, 0, tzinfo=timezone.utc)
+        self.assertTrue(cron_matches("0 0 * * 0", dt_sun))
+        self.assertTrue(cron_matches("0 0 * * 7", dt_sun))
+        self.assertFalse(cron_matches("0 0 * * 1", dt_sun))
+
+    def test_day_of_week_monday(self):
+        # Jan 5, 2026 = Monday = Python weekday 0 = cron DOW 1
+        dt_mon = datetime(2026, 1, 5, 0, 0, tzinfo=timezone.utc)
+        self.assertTrue(cron_matches("0 0 * * 1", dt_mon))
+        self.assertFalse(cron_matches("0 0 * * 0", dt_mon))
 
     def test_day_of_month(self):
         self.assertTrue(cron_matches("0 0 1 * *", self._dt(day=1)))
@@ -142,6 +169,11 @@ class TestNextCronMatch(unittest.TestCase):
         result = next_cron_match("*/5 * * * *", after=base)
         self.assertTrue(result - base < timedelta(hours=48))
 
+    def test_no_match_raises_value_error(self):
+        # Feb 30 does not exist -- no match within 48h
+        with self.assertRaises(ValueError):
+            next_cron_match("0 0 30 2 *")
+
 
 # ---------------------------------------------------------------------------
 # 4. TimeWindow
@@ -191,6 +223,15 @@ class TestTimeWindow(unittest.TestCase):
         dt_off = datetime(2026, 1, 7, 10, 0, tzinfo=timezone.utc)   # Wednesday
         self.assertTrue(tw.is_peak(dt_peak))
         self.assertFalse(tw.is_peak(dt_off))
+
+    def test_next_off_peak_peak_end_hour_24(self):
+        # peak_end_hour=24 must not call dt.replace(hour=24) -- rolls to midnight next day
+        tw = TimeWindow(peak_start_hour=0, peak_end_hour=24, peak_days=list(range(7)))
+        dt = datetime(2026, 1, 7, 15, 0, tzinfo=timezone.utc)
+        result = tw.next_off_peak(dt)
+        self.assertEqual(result.hour, 0)
+        self.assertEqual(result.minute, 0)
+        self.assertEqual(result.day, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -303,16 +344,34 @@ class TestJobStore(unittest.TestCase):
             store.save_all([])
             self.assertEqual(store.load_all(), [])
 
+    def test_corrupt_entry_skipped(self):
+        """Individual corrupt entries are skipped; valid ones survive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "jobs.json"
+            data = [
+                {"job_id": "good", "name": "good job"},
+                {"job_id": "bad", "status": "not_a_real_status"},
+            ]
+            p.write_text(json.dumps(data))
+            store = JobStore(p)
+            loaded = store.load_all()
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].job_id, "good")
+
 
 # ---------------------------------------------------------------------------
 # 7. JobScheduler.should_run
 # ---------------------------------------------------------------------------
 class TestShouldRun(unittest.TestCase):
+    def setUp(self):
+        # Fix #11: keep TemporaryDirectory alive on the instance
+        self._tmpdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
     def _make_scheduler(self, time_window=None, quota_checker=None):
-        with tempfile.TemporaryDirectory() as tmp:
-            pass
-        # We use a store but won't persist
-        store = JobStore(Path(tmp) / "jobs.json")
+        store = JobStore(Path(self._tmpdir.name) / "jobs.json")
         return JobScheduler(store=store, time_window=time_window, quota_checker=quota_checker)
 
     def _make_job(self, **kw):
@@ -331,10 +390,7 @@ class TestShouldRun(unittest.TestCase):
 
     def test_runs_when_due(self):
         sched = self._make_scheduler()
-        job = self._make_job(
-            next_run=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
-            respect_peak_hours=False,
-        )
+        job = self._make_job(next_run=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
         ok, reason = sched.should_run(job)
         self.assertTrue(ok)
         self.assertEqual(reason, "ready")
@@ -359,8 +415,8 @@ class TestShouldRun(unittest.TestCase):
         self.assertFalse(ok)
 
     def test_defers_normal_during_peak(self):
-        # Create a time window where it's always peak (0 <= hour < 24)
-        tw = TimeWindow(peak_start_hour=0, peak_end_hour=24, peak_days=list(range(7)))
+        # peak_end_hour=23: hours 0..22 are peak (real hour is always < 23)
+        tw = TimeWindow(peak_start_hour=0, peak_end_hour=23, peak_days=list(range(7)))
         sched = self._make_scheduler(time_window=tw)
         job = self._make_job(
             priority=JobPriority.NORMAL,
@@ -371,7 +427,7 @@ class TestShouldRun(unittest.TestCase):
         self.assertIn("peak", reason)
 
     def test_defers_low_during_peak(self):
-        tw = TimeWindow(peak_start_hour=0, peak_end_hour=24, peak_days=list(range(7)))
+        tw = TimeWindow(peak_start_hour=0, peak_end_hour=23, peak_days=list(range(7)))
         sched = self._make_scheduler(time_window=tw)
         job = self._make_job(
             priority=JobPriority.LOW,
@@ -382,7 +438,7 @@ class TestShouldRun(unittest.TestCase):
         self.assertIn("peak", reason)
 
     def test_critical_ignores_peak(self):
-        tw = TimeWindow(peak_start_hour=0, peak_end_hour=24, peak_days=list(range(7)))
+        tw = TimeWindow(peak_start_hour=0, peak_end_hour=23, peak_days=list(range(7)))
         sched = self._make_scheduler(time_window=tw)
         job = self._make_job(
             priority=JobPriority.CRITICAL,
@@ -437,19 +493,34 @@ class TestShouldRun(unittest.TestCase):
         job = self._make_job(
             next_run=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
         )
-        sched._running_jobs[job.job_id] = True
+        with sched._running_lock:
+            sched._running_jobs[job.job_id] = True
         ok, reason = sched.should_run(job)
         self.assertFalse(ok)
         self.assertIn("already running", reason)
+
+    def test_naive_next_run_normalized_to_utc(self):
+        sched = self._make_scheduler()
+        naive_past = (datetime.now(timezone.utc) - timedelta(minutes=5)).replace(tzinfo=None)
+        job = self._make_job(next_run=naive_past.isoformat())
+        ok, reason = sched.should_run(job)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ready")
 
 
 # ---------------------------------------------------------------------------
 # 8. JobScheduler._advance_schedule
 # ---------------------------------------------------------------------------
 class TestAdvanceSchedule(unittest.TestCase):
+    def setUp(self):
+        # Fix #11: keep TemporaryDirectory alive on the instance
+        self._tmpdir = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
     def _make_scheduler(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = JobStore(Path(tmp) / "jobs.json")
+        store = JobStore(Path(self._tmpdir.name) / "jobs.json")
         return JobScheduler(store=store)
 
     def test_once_completed(self):
@@ -614,11 +685,48 @@ class TestAddJob(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = JobStore(Path(tmp) / "jobs.json")
             sched = JobScheduler(store=store)
-            job = ScheduledJob(job_id="persist1", name="persisted")
+            job = ScheduledJob(job_id="persist1", name="persisted",
+                               schedule_type=ScheduleType.ONCE)
             sched.add_job(job)
             loaded = store.load_all()
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].job_id, "persist1")
+
+    def test_add_cron_job_empty_expression_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JobStore(Path(tmp) / "jobs.json")
+            sched = JobScheduler(store=store)
+            job = ScheduledJob(
+                job_id="bad-cron",
+                schedule_type=ScheduleType.CRON,
+                cron_expression="",
+            )
+            with self.assertRaises(ValueError):
+                sched.add_job(job)
+
+    def test_add_interval_job_zero_minutes_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JobStore(Path(tmp) / "jobs.json")
+            sched = JobScheduler(store=store)
+            job = ScheduledJob(
+                job_id="bad-interval",
+                schedule_type=ScheduleType.INTERVAL,
+                interval_minutes=0,
+            )
+            with self.assertRaises(ValueError):
+                sched.add_job(job)
+
+    def test_add_interval_job_negative_minutes_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = JobStore(Path(tmp) / "jobs.json")
+            sched = JobScheduler(store=store)
+            job = ScheduledJob(
+                job_id="bad-interval-neg",
+                schedule_type=ScheduleType.INTERVAL,
+                interval_minutes=-5,
+            )
+            with self.assertRaises(ValueError):
+                sched.add_job(job)
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +737,8 @@ class TestCRUD(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         store = JobStore(Path(tmp) / "jobs.json")
         sched = JobScheduler(store=store)
-        job = ScheduledJob(job_id="crud1", name="crud test")
+        job = ScheduledJob(job_id="crud1", name="crud test",
+                           schedule_type=ScheduleType.ONCE)
         sched.add_job(job)
         return sched, job
 

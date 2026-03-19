@@ -11,6 +11,7 @@ Supports:
 - Pluggable executor (Claude CLI, A2A agents, shell commands)
 - Retry with exponential backoff
 - Concurrency limiting via ThreadPoolExecutor
+- Run history tracking (JSONL-backed)
 """
 from __future__ import annotations
 
@@ -69,7 +70,11 @@ class TimeWindow:
         dt = dt or datetime.now(timezone.utc)
         if not self.is_peak(dt):
             return dt
-        candidate = dt.replace(hour=self.peak_end_hour, minute=0, second=0, microsecond=0)
+        # Fix #1: handle peak_end_hour >= 24 (dt.replace(hour=24) raises ValueError)
+        if self.peak_end_hour >= 24:
+            candidate = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            candidate = dt.replace(hour=self.peak_end_hour, minute=0, second=0, microsecond=0)
         if candidate <= dt:
             candidate += timedelta(days=1)
         # Skip weekends if peak_days is weekdays only
@@ -133,22 +138,71 @@ class ScheduledJob:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
+@dataclass
+class RunRecord:
+    """A single execution record for a scheduled job."""
+    job_id: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    status: str = "unknown"  # "success" | "failed" | "error"
+    duration_seconds: float = 0.0
+    error: Optional[str] = None
+    attempt_count: int = 1
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RunRecord":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
 def parse_cron_field(field_str: str, min_val: int, max_val: int) -> List[int]:
-    """Parse a single cron field into a list of matching integers."""
+    """Parse a single cron field into a list of matching integers.
+
+    Fix #2: validate step != 0, clamp range bounds, validate non-integer tokens.
+    """
     values = set()
     for part in field_str.split(","):
         part = part.strip()
         if part == "*":
             values.update(range(min_val, max_val + 1))
         elif part.startswith("*/"):
-            step = int(part[2:])
+            step_str = part[2:]
+            if not step_str.isdigit():
+                raise ValueError(f"Invalid cron step: {part!r}")
+            step = int(step_str)
+            if step == 0:
+                raise ValueError(f"Cron step cannot be zero: {part!r}")
             values.update(range(min_val, max_val + 1, step))
         elif "-" in part:
-            start, end = part.split("-", 1)
-            values.update(range(int(start), int(end) + 1))
+            raw_start, raw_end = part.split("-", 1)
+            if not raw_start.strip().isdigit() or not raw_end.strip().isdigit():
+                raise ValueError(f"Invalid cron range: {part!r}")
+            start = max(min_val, int(raw_start))
+            end = min(max_val, int(raw_end))
+            if start <= end:
+                values.update(range(start, end + 1))
         else:
+            if not part.isdigit():
+                raise ValueError(f"Invalid cron token: {part!r}")
             values.add(int(part))
     return sorted(v for v in values if min_val <= v <= max_val)
+
+
+def _translate_dow(cron_dow_values: List[int]) -> List[int]:
+    """Translate cron DOW values to Python weekday() values.
+
+    Fix #3: standard cron uses Sun=0 (or 7), Mon=1..Sat=6.
+    Python datetime.weekday() uses Mon=0..Sun=6.
+    Mapping: cron 0 or 7 -> Python 6 (Sunday), cron N (1-6) -> Python N-1.
+    """
+    python_days = set()
+    for d in cron_dow_values:
+        if d == 0 or d == 7:
+            python_days.add(6)  # Sunday
+        else:
+            python_days.add(d - 1)  # Mon=1->0, Tue=2->1, ..., Sat=6->5
+    return sorted(python_days)
 
 
 def cron_matches(expression: str, dt: datetime) -> bool:
@@ -157,12 +211,14 @@ def cron_matches(expression: str, dt: datetime) -> bool:
     if len(fields) != 5:
         return False
     minute, hour, dom, month, dow = fields
+    # Fix #3: translate DOW from cron convention to Python weekday convention
+    dow_values = _translate_dow(parse_cron_field(dow, 0, 7))
     return (
         dt.minute in parse_cron_field(minute, 0, 59)
         and dt.hour in parse_cron_field(hour, 0, 23)
         and dt.day in parse_cron_field(dom, 1, 31)
         and dt.month in parse_cron_field(month, 1, 12)
-        and dt.weekday() in parse_cron_field(dow, 0, 6)
+        and dt.weekday() in dow_values
     )
 
 
@@ -174,7 +230,72 @@ def next_cron_match(expression: str, after: Optional[datetime] = None) -> dateti
         if cron_matches(expression, dt):
             return dt
         dt += timedelta(minutes=1)
-    return dt  # fallback
+    raise ValueError(f"No cron match found within 48h for expression: {expression!r}")
+
+
+class RunHistoryStore:
+    """JSONL file-backed run history persistence."""
+
+    def __init__(self, path: Path, max_records_per_job: int = 50):
+        if isinstance(path, str):
+            path = Path(path)
+        self._path = path
+        self._max_per_job = max_records_per_job
+        self._lock = threading.Lock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, record: RunRecord) -> None:
+        """Append a run record to the JSONL file."""
+        with self._lock:
+            with open(self._path, "a") as f:
+                f.write(json.dumps(record.to_dict(), default=str) + "\n")
+
+    def get_history(self, job_id: Optional[str] = None, limit: int = 20) -> List[RunRecord]:
+        """Load run history, optionally filtered by job_id."""
+        with self._lock:
+            if not self._path.exists():
+                return []
+            records: List[RunRecord] = []
+            try:
+                for line in self._path.read_text().strip().split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        rec = RunRecord.from_dict(data)
+                        if job_id is None or rec.job_id == job_id:
+                            records.append(rec)
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+            except Exception:
+                logger.warning("Error reading run history from %s", self._path)
+                return []
+            records.reverse()
+            return records[:limit]
+
+    def prune(self, job_id: str) -> None:
+        """Keep only the last max_records_per_job entries for a given job."""
+        with self._lock:
+            if not self._path.exists():
+                return
+            job_lines: List[str] = []
+            other_lines: List[str] = []
+            for line in self._path.read_text().strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("job_id") == job_id:
+                        job_lines.append(line)
+                    else:
+                        other_lines.append(line)
+                except json.JSONDecodeError:
+                    other_lines.append(line)
+            kept = job_lines[-self._max_per_job:]
+            all_lines = other_lines + kept
+            self._path.write_text("\n".join(all_lines) + "\n" if all_lines else "")
 
 
 class JobStore:
@@ -187,32 +308,57 @@ class JobStore:
         self._lock = threading.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
+    def _load_all_locked(self) -> List[ScheduledJob]:
+        """Load all jobs; caller must hold _lock."""
+        if not self._path.exists():
+            return []
+        try:
+            data = json.loads(self._path.read_text())
+            jobs = []
+            # Fix #5: skip corrupt individual entries instead of crashing
+            for j in data:
+                try:
+                    jobs.append(ScheduledJob.from_dict(j))
+                except (ValueError, TypeError, KeyError) as exc:
+                    logger.warning("Skipping corrupt job entry: %s", exc)
+            return jobs
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("Corrupt job store at %s — returning empty", self._path)
+            return []
+
     def load_all(self) -> List[ScheduledJob]:
         with self._lock:
-            if not self._path.exists():
-                return []
-            try:
-                data = json.loads(self._path.read_text())
-                return [ScheduledJob.from_dict(j) for j in data]
-            except (json.JSONDecodeError, KeyError):
-                logger.warning("Corrupt job store at %s — returning empty", self._path)
-                return []
+            return self._load_all_locked()
 
     def save_all(self, jobs: List[ScheduledJob]) -> None:
         with self._lock:
             tmp = self._path.with_suffix(".tmp")
             tmp.write_text(json.dumps([j.to_dict() for j in jobs], indent=2, default=str))
-            tmp.rename(self._path)
+            # Fix #6: use replace() for atomic cross-platform writes
+            tmp.replace(self._path)
 
     def upsert(self, job: ScheduledJob) -> None:
+        # Fix #7: hold _lock across the full read-modify-write in a single block
+        with self._lock:
+            jobs = self._load_all_locked()
+            for i, j in enumerate(jobs):
+                if j.job_id == job.job_id:
+                    jobs[i] = job
+                    break
+            else:
+                jobs.append(job)
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps([j.to_dict() for j in jobs], indent=2, default=str))
+            tmp.replace(self._path)
+
+    def delete_job(self, job_id: str) -> bool:
+        """Permanently remove a job from the store. Returns True if found and deleted."""
         jobs = self.load_all()
-        for i, j in enumerate(jobs):
-            if j.job_id == job.job_id:
-                jobs[i] = job
-                self.save_all(jobs)
-                return
-        jobs.append(job)
-        self.save_all(jobs)
+        filtered = [j for j in jobs if j.job_id != job_id]
+        if len(filtered) == len(jobs):
+            return False
+        self.save_all(filtered)
+        return True
 
 
 class JobScheduler:
@@ -242,13 +388,31 @@ class JobScheduler:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running_jobs: Dict[str, bool] = {}
+        # Fix #9: dedicated lock for _running_jobs dict
+        self._running_lock = threading.Lock()
+        # Run history store (sibling to the job store file)
+        self._history = RunHistoryStore(
+            self._store._path.parent / "run_history.jsonl"
+        )
 
     # --- CRUD ---
 
     def add_job(self, job: ScheduledJob) -> ScheduledJob:
-        if job.schedule_type == ScheduleType.CRON and job.cron_expression:
-            job.next_run = next_cron_match(job.cron_expression).isoformat()
-        elif job.schedule_type == ScheduleType.INTERVAL and job.interval_minutes > 0:
+        # Fix #8: validate schedule parameters
+        if job.schedule_type == ScheduleType.CRON:
+            if not job.cron_expression:
+                raise ValueError(f"Cron job {job.name!r} must have a non-empty cron_expression")
+            try:
+                job.next_run = next_cron_match(job.cron_expression).isoformat()
+            except ValueError as exc:
+                job.status = JobStatus.PENDING
+                job.last_error = str(exc)
+                self._store.upsert(job)
+                logger.warning("add_job: cron expression error for %s: %s", job.name, exc)
+                return job
+        elif job.schedule_type == ScheduleType.INTERVAL:
+            if job.interval_minutes <= 0:
+                raise ValueError(f"Interval job {job.name!r} must have interval_minutes > 0")
             job.next_run = (datetime.now(timezone.utc) + timedelta(minutes=job.interval_minutes)).isoformat()
         job.status = JobStatus.SCHEDULED
         self._store.upsert(job)
@@ -299,6 +463,20 @@ class JobScheduler:
         self._pool.submit(self._execute_job, job)
         return job
 
+    def delete_job(self, job_id: str) -> bool:
+        """Permanently remove a job from the store and running state."""
+        # Fix #9: protect _running_jobs
+        with self._running_lock:
+            self._running_jobs.pop(job_id, None)
+        deleted = self._store.delete_job(job_id)
+        if deleted:
+            logger.info("Job deleted: %s", job_id)
+        return deleted
+
+    def get_run_history(self, job_id: Optional[str] = None, limit: int = 20) -> List[RunRecord]:
+        """Get run history records, optionally filtered by job_id."""
+        return self._history.get_history(job_id=job_id, limit=limit)
+
     # --- Scheduling logic ---
 
     def should_run(self, job: ScheduledJob) -> tuple[bool, str]:
@@ -306,14 +484,19 @@ class JobScheduler:
         if not job.enabled or job.status not in (JobStatus.SCHEDULED, JobStatus.PENDING):
             return False, "not enabled or not scheduled"
 
-        if job.job_id in self._running_jobs:
-            return False, "already running"
+        # Fix #9: protect _running_jobs with lock
+        with self._running_lock:
+            if job.job_id in self._running_jobs:
+                return False, "already running"
 
         now = datetime.now(timezone.utc)
 
         # Check if it's time
         if job.next_run:
             next_dt = datetime.fromisoformat(job.next_run)
+            # Fix #10: normalize naive datetimes to UTC
+            if next_dt.tzinfo is None:
+                next_dt = next_dt.replace(tzinfo=timezone.utc)
             if now < next_dt:
                 return False, f"not due until {job.next_run}"
 
@@ -340,21 +523,31 @@ class JobScheduler:
             job.status = JobStatus.COMPLETED
             job.next_run = None
         elif job.schedule_type == ScheduleType.CRON:
-            job.next_run = next_cron_match(job.cron_expression, after=now).isoformat()
+            try:
+                job.next_run = next_cron_match(job.cron_expression, after=now).isoformat()
+            except ValueError as exc:
+                logger.warning("_advance_schedule: cron error for %s: %s", job.name, exc)
+                job.status = JobStatus.PENDING
+                job.last_error = str(exc)
+                return
             job.status = JobStatus.SCHEDULED
         elif job.schedule_type == ScheduleType.INTERVAL:
             job.next_run = (now + timedelta(minutes=job.interval_minutes)).isoformat()
             job.status = JobStatus.SCHEDULED
 
     def _execute_job(self, job: ScheduledJob) -> None:
-        """Execute a single job with retry logic."""
-        self._running_jobs[job.job_id] = True
+        """Execute a single job with retry logic. Records run history."""
+        # Fix #9: protect _running_jobs
+        with self._running_lock:
+            self._running_jobs[job.job_id] = True
         job.status = JobStatus.RUNNING
-        job.last_run = datetime.now(timezone.utc).isoformat()
+        start_time = datetime.now(timezone.utc)
+        job.last_run = start_time.isoformat()
         self._store.upsert(job)
 
         attempt = 0
         success = False
+        last_error_msg: Optional[str] = None
         while attempt <= job.max_retries:
             try:
                 self._executor(job)
@@ -362,11 +555,15 @@ class JobScheduler:
                 break
             except Exception as exc:
                 attempt += 1
-                job.last_error = f"Attempt {attempt}: {str(exc)[:200]}"
+                last_error_msg = f"Attempt {attempt}: {str(exc)[:200]}"
+                job.last_error = last_error_msg
                 logger.warning("Job %s attempt %d failed: %s", job.job_id, attempt, exc)
                 if attempt <= job.max_retries:
                     backoff = job.retry_backoff_seconds * (2 ** (attempt - 1))
                     self._stop_event.wait(min(backoff, 300))
+
+        end_time = datetime.now(timezone.utc)
+        duration = (end_time - start_time).total_seconds()
 
         job.run_count += 1
         if success:
@@ -377,8 +574,21 @@ class JobScheduler:
             job.status = JobStatus.FAILED
             logger.error("Job %s failed after %d retries", job.name, job.max_retries + 1)
 
+        # Record run history
+        record = RunRecord(
+            job_id=job.job_id,
+            timestamp=start_time.isoformat(),
+            status="success" if success else "failed",
+            duration_seconds=round(duration, 2),
+            error=last_error_msg if not success else None,
+            attempt_count=attempt + (1 if success else 0),
+        )
+        self._history.append(record)
+
         self._store.upsert(job)
-        self._running_jobs.pop(job.job_id, None)
+        # Fix #9: protect _running_jobs
+        with self._running_lock:
+            self._running_jobs.pop(job.job_id, None)
 
     def _default_executor(self, job: ScheduledJob) -> None:
         logger.info("DEFAULT EXECUTOR (stub): job=%s instructions=%s", job.name, job.instructions[:100])
