@@ -1,0 +1,12 @@
+project:
+  name: my-project
+  repo: org/repo-name
+  local_path: /path/to/repo
+
+credentials:
+  github_token_env: GH_TOKEN
+
+budget:
+  daily_cap_usd: 50.00
+  monthly_cap_usd: 500.00
+  alert_threshold_pct: 80
