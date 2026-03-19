@@ -26,7 +26,7 @@ class PermissionDeniedError(Exception):
     pass
 
 
-class AgentRole:
+class RBACRole:
     """Parsed role definition for a single agent."""
 
     def __init__(self, name: str, data: Dict[str, Any]):
@@ -53,7 +53,7 @@ class RBACEngine:
 
     def __init__(self, roles_path: Optional[Path] = None):
         self._path = roles_path or _ROLES_PATH
-        self._roles: Dict[str, AgentRole] = {}
+        self._roles: Dict[str, RBACRole] = {}
         self._overrides: List[Dict] = []
         self._load()
 
@@ -65,7 +65,7 @@ class RBACEngine:
             with open(self._path) as f:
                 data = yaml.safe_load(f) or {}
             for name, role_data in data.get("roles", {}).items():
-                self._roles[name] = AgentRole(name, role_data)
+                self._roles[name] = RBACRole(name, role_data)
             self._overrides = data.get("overrides", [])
             logger.info("RBAC loaded: %d roles, %d overrides", len(self._roles), len(self._overrides))
         except Exception:
@@ -77,10 +77,10 @@ class RBACEngine:
         self._overrides.clear()
         self._load()
 
-    def get_role(self, agent_name: str) -> Optional[AgentRole]:
+    def get_role(self, agent_name: str) -> Optional[RBACRole]:
         return self._roles.get(agent_name)
 
-    def list_roles(self) -> Dict[str, AgentRole]:
+    def list_roles(self) -> Dict[str, RBACRole]:
         return dict(self._roles)
 
     def check_permission(
@@ -112,12 +112,48 @@ class RBACEngine:
             )
             return False, f"Agent '{agent_name}' is explicitly denied permission '{task}'"
 
+        # Evaluate strict overrides before base permission check.
+        # If a strict override covers this task and the agent is NOT in allow_agents, deny immediately.
+        for override in self._overrides:
+            if override.get("enforce") != "strict":
+                continue
+
+            condition = override.get("condition", {})
+
+            # Check if task matches this override
+            task_cond = condition.get("task")
+            if task_cond:
+                tasks = task_cond if isinstance(task_cond, list) else [task_cond]
+                if task not in tasks:
+                    continue
+
+            # Missing severity must NOT match a severity-conditioned override
+            sev_cond = condition.get("severity")
+            if sev_cond:
+                if not context.get("severity"):
+                    continue
+                sevs = sev_cond if isinstance(sev_cond, list) else [sev_cond]
+                if context["severity"] not in sevs:
+                    continue
+
+            # This strict override applies to this task — enforce it
+            allowed_agents = override.get("allow_agents", [])
+            if agent_name not in allowed_agents:
+                logger.critical(
+                    "RBAC DENIED (strict override): agent '%s' attempted '%s' — rule '%s'",
+                    agent_name, task, override.get("rule", "unnamed"),
+                )
+                return False, f"Agent '{agent_name}' denied by strict override: {override.get('rule', '')}"
+
         # Check base permission
         if role.has_permission(task):
             return True, "granted"
 
-        # Check overrides
+        # Check non-strict overrides
         for override in self._overrides:
+            if override.get("enforce") == "strict":
+                continue
+
             condition = override.get("condition", {})
             allowed_agents = override.get("allow_agents", [])
 
@@ -131,16 +167,15 @@ class RBACEngine:
                 if task not in tasks:
                     continue
 
-            # Check severity condition if present
+            # Missing severity must NOT match a severity-conditioned override
+            if "severity" in condition and not context.get("severity"):
+                continue
+
             sev_cond = condition.get("severity")
             if sev_cond and context.get("severity"):
                 sevs = sev_cond if isinstance(sev_cond, list) else [sev_cond]
                 if context["severity"] not in sevs:
                     continue
-
-            # Check enforce: strict (blocks everyone else)
-            if override.get("enforce") == "strict" and agent_name not in allowed_agents:
-                continue
 
             logger.info("RBAC override: agent '%s' granted '%s' via rule '%s'",
                         agent_name, task, override.get("rule", "unnamed"))
