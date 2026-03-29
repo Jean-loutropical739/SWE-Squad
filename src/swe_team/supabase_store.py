@@ -18,18 +18,31 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from src.swe_team.models import SWETicket, TicketStatus
+from src.swe_team.providers.notification.base import NotificationProvider
 
 logger = logging.getLogger(__name__)
+
+# Threshold for consecutive keepalive failures before a Telegram alert is sent.
+_KEEPALIVE_ALERT_THRESHOLD = 3
 
 # Statuses considered "closed" for list_open() filtering
 _CLOSED_STATUSES = frozenset({
     TicketStatus.RESOLVED.value,
     TicketStatus.CLOSED.value,
     TicketStatus.ACKNOWLEDGED.value,
+    TicketStatus.FAILED.value,   # exhausted all dev attempts
+    TicketStatus.BLOCKED.value,  # no files changed on all attempts
 })
+
+# File-based activity tracking for keepalive persistence across processes.
+# The in-memory _last_activity timestamp resets to now() on every process
+# start, which means keepalive checks always see "0 seconds ago" and skip.
+# This file persists the last successful API call timestamp to disk.
+_ACTIVITY_FILE_DEFAULT = Path("data/swe_team/supabase_last_activity.json")
 
 
 class SupabaseTicketStore:
@@ -46,6 +59,10 @@ class SupabaseTicketStore:
         Anon or service-role key for the project.
     team_id:
         Scoping identifier for this SWE team instance.
+    activity_file:
+        Path to the file used to persist the last API activity timestamp
+        across process restarts.  Defaults to
+        ``data/swe_team/supabase_last_activity.json``.
     """
 
     def __init__(
@@ -53,6 +70,8 @@ class SupabaseTicketStore:
         supabase_url: Optional[str] = None,
         supabase_key: Optional[str] = None,
         team_id: str = "default",
+        activity_file: Optional[Path] = None,
+        notifier: Optional[NotificationProvider] = None,
     ) -> None:
         self._url = (supabase_url or os.environ["SUPABASE_URL"]).rstrip("/")
         self._key = supabase_key or os.environ.get(
@@ -69,9 +88,17 @@ class SupabaseTicketStore:
         }
         # Fingerprint cache — loaded lazily on first access
         self._fingerprint_cache: Optional[Set[str]] = None
-        # Track last successful API activity for keep-alive logic.
-        # Supabase free tier pauses after 7 days of inactivity.
-        self._last_activity: datetime = datetime.now(timezone.utc)
+        # Write-failure alerting counters (in-memory; reset on process restart)
+        self._consecutive_write_failures: int = 0
+        self._consecutive_keepalive_failures: int = 0
+        self._write_errors_today: int = 0
+        self._last_successful_write: Optional[datetime] = None
+        # File-based activity tracking — persists across process restarts.
+        # Falls back to datetime.min if the file cannot be read, which
+        # guarantees the keepalive will fire on the first invocation.
+        self._activity_file: Path = activity_file or _ACTIVITY_FILE_DEFAULT
+        self._last_activity: datetime = self._load_last_activity()
+        self._notifier: Optional[NotificationProvider] = notifier
 
     # ------------------------------------------------------------------
     # Public interface (mirrors TicketStore)
@@ -114,36 +141,46 @@ class SupabaseTicketStore:
             return self._row_to_ticket(rows[0])
         return None
 
-    def list_all(self) -> List[SWETicket]:
-        """Return all tickets for this team, newest first."""
+    def list_all(self, limit: int = 500) -> List[SWETicket]:
+        """Return all tickets for this team, newest first.
+
+        Parameters
+        ----------
+        limit:
+            Maximum number of tickets to return (default 500).  Pass a larger
+            value only when you genuinely need the full history.
+        """
         params = {
             "team_id": f"eq.{self._team_id}",
             "order": "created_at.desc",
+            "limit": str(limit),
         }
         rows = self._request("GET", "/swe_tickets", params=params)
         return [self._row_to_ticket(r) for r in (rows or [])]
 
-    def list_by_status(self, status: TicketStatus) -> List[SWETicket]:
+    def list_by_status(self, status: TicketStatus, limit: int = 500) -> List[SWETicket]:
         """Return tickets with the given status."""
         params = {
             "team_id": f"eq.{self._team_id}",
             "status": f"eq.{status.value}",
             "order": "created_at.desc",
+            "limit": str(limit),
         }
         rows = self._request("GET", "/swe_tickets", params=params)
         return [self._row_to_ticket(r) for r in (rows or [])]
 
-    def list_open(self) -> List[SWETicket]:
-        """Return all tickets that are not resolved, closed, or acknowledged."""
+    def list_open(self, limit: int = 500) -> List[SWETicket]:
+        """Return all tickets that are not resolved, closed, acknowledged, failed, or blocked."""
         params = {
             "team_id": f"eq.{self._team_id}",
-            "status": "not.in.(resolved,closed,acknowledged)",
+            "status": "not.in.(resolved,closed,acknowledged,failed,blocked)",
             "order": "created_at.desc",
+            "limit": str(limit),
         }
         rows = self._request("GET", "/swe_tickets", params=params)
         return [self._row_to_ticket(r) for r in (rows or [])]
 
-    def list_recently_resolved(self, hours: int = 24) -> List[SWETicket]:
+    def list_recently_resolved(self, hours: int = 24, limit: int = 500) -> List[SWETicket]:
         """Return tickets resolved within the last *hours* hours."""
         cutoff = (
             datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -153,6 +190,7 @@ class SupabaseTicketStore:
             "status": "eq.resolved",
             "updated_at": f"gte.{cutoff}",
             "order": "updated_at.desc",
+            "limit": str(limit),
         }
         rows = self._request("GET", "/swe_tickets", params=params)
         return [self._row_to_ticket(r) for r in (rows or [])]
@@ -236,15 +274,26 @@ class SupabaseTicketStore:
         return "merged"
 
     def record_memory_hit(self, ticket_id: str, team_id: Optional[str] = None) -> None:
-        """Increment confidence for a memory ticket that was used."""
-        self._request(
-            "POST",
-            "/rpc/increment_memory_confidence",
-            body={
-                "p_ticket_id": ticket_id,
-                "p_team": team_id or self._team_id,
-            },
-        )
+        """Increment confidence for a memory ticket that was used.
+
+        Failures (DNS errors, network blips) are logged at DEBUG level and
+        do NOT trigger the write-failure Telegram alert — a missed confidence
+        increment is not a data-loss event.
+        """
+        try:
+            self._request(
+                "POST",
+                "/rpc/increment_memory_confidence",
+                body={
+                    "p_ticket_id": ticket_id,
+                    "p_team": team_id or self._team_id,
+                },
+            )
+        except Exception as exc:
+            logger.debug(
+                "record_memory_hit: failed to increment confidence for %s (non-fatal): %s",
+                ticket_id, exc,
+            )
 
     @property
     def known_fingerprints(self) -> Set[str]:
@@ -261,18 +310,23 @@ class SupabaseTicketStore:
         """Ping Supabase if no organic activity within *threshold_days*.
 
         Supabase free-tier pauses the database after 7 consecutive days
-        of inactivity.  This method checks the internal activity tracker
-        and, only when needed, issues a lightweight ``SELECT`` to count
-        as activity.
+        of inactivity.  This method reads the persisted activity timestamp
+        from disk (not an in-memory variable that resets each process) and,
+        only when needed, issues a lightweight ``SELECT`` to count as
+        activity.
 
         Returns ``True`` if a keep-alive ping was sent, ``False`` if
         organic traffic was recent enough to skip it.
         """
-        age = datetime.now(timezone.utc) - self._last_activity
+        # Re-read from disk to get the true last activity across all
+        # processes (cron invocations, daemon restarts, etc.).
+        last = self._load_last_activity()
+        age = datetime.now(timezone.utc) - last
         if age < timedelta(days=threshold_days):
             logger.info(
-                "Supabase keep-alive: skipped (last activity %s ago)",
-                age,
+                "Supabase keep-alive: skipped (last activity %s ago, "
+                "from %s)",
+                age, self._activity_file,
             )
             return False
 
@@ -289,12 +343,63 @@ class SupabaseTicketStore:
                 params={"select": "ticket_id", "limit": "1"},
             )
             logger.info("Supabase keep-alive: ping successful")
+            self._consecutive_keepalive_failures = 0
             return True
         except Exception:
+            self._consecutive_keepalive_failures += 1
             logger.warning(
-                "Supabase keep-alive: ping failed", exc_info=True,
+                "Supabase keep-alive: ping failed (consecutive failures: %d)",
+                self._consecutive_keepalive_failures,
+                exc_info=True,
             )
+            if self._consecutive_keepalive_failures >= _KEEPALIVE_ALERT_THRESHOLD:
+                self._alert(
+                    f"\U0001f534 <b>Supabase keepalive failing</b>\n"
+                    f"Consecutive ping failures: {self._consecutive_keepalive_failures}\n"
+                    f"Supabase may be paused or unreachable. "
+                    f"Ticket writes are at risk of data loss."
+                )
             return False
+
+    # ------------------------------------------------------------------
+    # Persistent activity tracking (file-based)
+    # ------------------------------------------------------------------
+
+    def _load_last_activity(self) -> datetime:
+        """Load the last activity timestamp from disk.
+
+        Returns ``datetime.min`` (UTC) if the file does not exist or is
+        unreadable, which guarantees the keepalive will fire on the first
+        invocation after a fresh install or data wipe.
+        """
+        try:
+            if self._activity_file.exists():
+                data = json.loads(self._activity_file.read_text())
+                ts = data.get("last_activity")
+                if ts:
+                    return datetime.fromisoformat(ts)
+        except Exception:
+            logger.debug(
+                "Could not read activity file %s, treating as stale",
+                self._activity_file,
+                exc_info=True,
+            )
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    def _save_last_activity(self, ts: datetime) -> None:
+        """Persist the activity timestamp to disk."""
+        try:
+            self._activity_file.parent.mkdir(parents=True, exist_ok=True)
+            self._activity_file.write_text(json.dumps({
+                "last_activity": ts.isoformat(),
+                "team_id": self._team_id,
+            }))
+        except Exception:
+            logger.debug(
+                "Could not write activity file %s",
+                self._activity_file,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Audit trail
@@ -327,8 +432,56 @@ class SupabaseTicketStore:
             )
 
     # ------------------------------------------------------------------
+    # Internal alerting helpers
+    # ------------------------------------------------------------------
+
+    def _alert(self, message: str) -> None:
+        """Send an alert via the injected NotificationProvider (or legacy fallback).
+
+        Never raises.
+        """
+        if self._notifier:
+            try:
+                self._notifier.send_alert(message, level="warning")
+            except Exception:  # noqa: BLE001
+                logger.debug("NotificationProvider.send_alert failed", exc_info=True)
+        else:
+            try:
+                from src.swe_team.notifier import _send  # noqa: PLC0415
+                _send(message)
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not send Telegram alert", exc_info=True)
+
+    def health_stats(self) -> Dict[str, Any]:
+        """Return a dict of Supabase health counters for inclusion in status.json."""
+        return {
+            "supabase_write_errors_today": self._write_errors_today,
+            "supabase_last_successful_write": (
+                self._last_successful_write.isoformat()
+                if self._last_successful_write
+                else None
+            ),
+            "supabase_consecutive_write_failures": self._consecutive_write_failures,
+            "supabase_consecutive_keepalive_failures": self._consecutive_keepalive_failures,
+        }
+
+    # ------------------------------------------------------------------
     # HTTP helpers (stdlib urllib — zero external deps)
     # ------------------------------------------------------------------
+
+    # Paths where write failures should NOT send the high-priority Telegram
+    # alert. Write counters are still incremented for observability, but the
+    # 🚨 alert is suppressed for non-critical advisory RPC calls.
+    _NO_WRITE_ALERT_PATHS: frozenset = frozenset({
+        "/rpc/increment_memory_confidence",
+        "/rpc/match_similar_tickets",  # semantic search is advisory, not data-critical
+    })
+
+    # Minimum consecutive write failures before a Telegram alert fires.
+    # Parallel workers each have their own SupabaseStore instance, so a single
+    # Supabase blip can trigger N alerts (one per worker). Only alert after
+    # this many back-to-back failures on the same instance to reduce noise.
+    _ALERT_THRESHOLD: int = 3
 
     def _request(
         self,
@@ -353,7 +506,13 @@ class SupabaseTicketStore:
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 raw = resp.read().decode()
-                self._last_activity = datetime.now(timezone.utc)
+                now = datetime.now(timezone.utc)
+                self._last_activity = now
+                self._save_last_activity(now)
+                # Reset write-failure counter on any successful write request
+                if method in ("POST", "PATCH", "PUT", "DELETE"):
+                    self._consecutive_write_failures = 0
+                    self._last_successful_write = now
                 if raw:
                     return json.loads(raw)
                 return None
@@ -363,9 +522,54 @@ class SupabaseTicketStore:
                 "Supabase %s %s failed (%d): %s",
                 method, path, exc.code, error_body[:500],
             )
+            # Alert on write failures (4xx/5xx) — these risk data loss
+            if method in ("POST", "PATCH", "PUT", "DELETE"):
+                self._consecutive_write_failures += 1
+                self._write_errors_today += 1
+                logger.warning(
+                    "Supabase write failure #%d (HTTP %d) on %s %s",
+                    self._consecutive_write_failures, exc.code, method, path,
+                )
+                if (
+                    path not in self._NO_WRITE_ALERT_PATHS
+                    and self._consecutive_write_failures >= self._ALERT_THRESHOLD
+                ):
+                    self._alert(
+                        f"\U0001f6a8 <b>Supabase write failure</b> (data loss risk)\n"
+                        f"Method: {method} {path}\n"
+                        f"HTTP status: {exc.code}\n"
+                        f"Consecutive failures: {self._consecutive_write_failures}\n"
+                        f"Errors today: {self._write_errors_today}\n"
+                        f"Detail: {error_body[:300]}"
+                    )
             raise
         except urllib.error.URLError as exc:
-            logger.error("Supabase connection error: %s", exc.reason)
+            if path in self._NO_WRITE_ALERT_PATHS:
+                logger.debug(
+                    "Supabase connection error on non-critical path %s (non-fatal): %s",
+                    path, exc.reason,
+                )
+            else:
+                logger.error("Supabase connection error: %s", exc.reason)
+            # Connection errors on writes also count as write failures
+            if method in ("POST", "PATCH", "PUT", "DELETE"):
+                self._consecutive_write_failures += 1
+                self._write_errors_today += 1
+                logger.warning(
+                    "Supabase write connection error #%d on %s %s: %s",
+                    self._consecutive_write_failures, method, path, exc.reason,
+                )
+                if (
+                    path not in self._NO_WRITE_ALERT_PATHS
+                    and self._consecutive_write_failures >= self._ALERT_THRESHOLD
+                ):
+                    self._alert(
+                        f"\U0001f6a8 <b>Supabase write connection error</b> (data loss risk)\n"
+                        f"Method: {method} {path}\n"
+                        f"Reason: {exc.reason}\n"
+                        f"Consecutive failures: {self._consecutive_write_failures}\n"
+                        f"Errors today: {self._write_errors_today}"
+                    )
             raise
 
     # ------------------------------------------------------------------
@@ -376,6 +580,15 @@ class SupabaseTicketStore:
         """Convert a SWETicket to a Supabase row dict."""
         d = ticket.to_dict()
         d["team_id"] = self._team_id
+        # Strip fields not in Supabase DDL schema to avoid PGRST204 400 errors
+        for key in ("ticket_type", "blocked_by", "blocking"):
+            d.pop(key, None)
+        # Map statuses not in the Supabase check constraint to valid equivalents.
+        # 'failed' and 'blocked' are Python-side states; Supabase schema uses
+        # 'closed' and 'acknowledged' respectively.
+        _status_map = {"failed": "closed", "blocked": "acknowledged"}
+        if d.get("status") in _status_map:
+            d["status"] = _status_map[d["status"]]
         # Ensure JSONB fields are actual dicts/lists, not strings
         for key in ("labels", "related_tickets", "metadata", "test_results"):
             val = d.get(key)
@@ -384,13 +597,36 @@ class SupabaseTicketStore:
                     d[key] = json.loads(val)
                 except (json.JSONDecodeError, TypeError):
                     pass
+        # Session ID fields — only include if populated AND columns exist.
+        # Gracefully handles Supabase deployments that haven't run the
+        # ALTER TABLE migration yet (avoids PGRST204 400 errors).
+        if ticket.investigation_session_id is not None:
+            d["investigation_session_id"] = ticket.investigation_session_id
+        else:
+            d.pop("investigation_session_id", None)
+        if ticket.development_session_id is not None:
+            d["development_session_id"] = ticket.development_session_id
+        else:
+            d.pop("development_session_id", None)
         return d
 
     @staticmethod
     def _row_to_ticket(row: Dict[str, Any]) -> SWETicket:
         """Convert a Supabase row back to a SWETicket."""
-        # PostgREST returns JSONB as dicts already, but ensure strings
-        # round-trip safely for the SWETicket.from_dict() contract.
+        # PostgREST returns JSONB as dicts already, but some rows may have
+        # metadata stored as a JSON string (e.g. from manual PATCH calls).
+        # Normalise to dict before passing to from_dict().
+        if isinstance(row.get("metadata"), str):
+            try:
+                row = dict(row)
+                row["metadata"] = json.loads(row["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                row = dict(row)
+                row["metadata"] = {}
+        # Ensure session ID fields are present (graceful for rows predating these columns)
+        row = dict(row)
+        row.setdefault("investigation_session_id", None)
+        row.setdefault("development_session_id", None)
         return SWETicket.from_dict(row)
 
     def _load_fingerprints(self) -> Set[str]:
@@ -416,6 +652,34 @@ class SupabaseTicketStore:
             len(fps), self._team_id,
         )
         return fps
+
+    def claim_ticket(self, ticket_id: str, agent_id: str) -> bool:
+        """Atomically claim a ticket using Postgres advisory lock via RPC.
+
+        Returns True if claimed, False if another agent holds it.
+        Falls back to True on any RPC error to not block local mode.
+        """
+        try:
+            result = self._request(
+                "POST",
+                "/rpc/claim_ticket",
+                body={"p_ticket_id": ticket_id, "p_agent_id": agent_id},
+            )
+            return bool(result)
+        except Exception as exc:
+            logger.warning("claim_ticket RPC failed — rejecting claim (fail-closed): %s", exc)
+            return False
+
+    def release_ticket(self, ticket_id: str, reset_status: str = "OPEN") -> None:
+        """Release a ticket claim. Used by watchdog for stale ticket recovery."""
+        try:
+            self._request(
+                "POST",
+                "/rpc/release_ticket",
+                body={"p_ticket_id": ticket_id, "p_reset_status": reset_status},
+            )
+        except Exception as exc:
+            logger.warning("release_ticket RPC failed (non-fatal): %s", exc)
 
     @staticmethod
     def _vector_literal(embedding: List[float]) -> str:
