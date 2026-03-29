@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from src.swe_team.models import AgentRole, SWEAgentConfig
+from src.swe_team.parallel_executor import ExecutionConfig
+from src.swe_team.throttle import ThrottleConfig
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,8 @@ class MonitorConfig:
     scan_interval_minutes: int = 30
     dedup_window_hours: int = 24    # Avoid re-filing the same issue
     enabled: bool = False
+    remote_workers: List[Dict[str, str]] = field(default_factory=list)
+    worker_module_map: Dict[str, List[str]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MonitorConfig":
@@ -103,6 +107,8 @@ class MonitorConfig:
             scan_interval_minutes=data.get("scan_interval_minutes", 30),
             dedup_window_hours=data.get("dedup_window_hours", 24),
             enabled=data.get("enabled", False),
+            remote_workers=data.get("remote_workers", []),
+            worker_module_map=data.get("worker_module_map", {}),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -113,6 +119,8 @@ class MonitorConfig:
             "scan_interval_minutes": self.scan_interval_minutes,
             "dedup_window_hours": self.dedup_window_hours,
             "enabled": self.enabled,
+            "remote_workers": self.remote_workers,
+            "worker_module_map": self.worker_module_map,
         }
 
 
@@ -165,6 +173,159 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
+# Rate limit backoff settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RateLimitConfig:
+    """Settings for exponential backoff on Claude Code CLI rate limits (429).
+
+    Controls retry behaviour when the CLI returns a rate limit error.
+    """
+
+    max_retries_on_429: int = 3
+    initial_backoff_seconds: float = 30
+    max_backoff_seconds: float = 300
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RateLimitConfig":
+        return cls(
+            max_retries_on_429=data.get("max_retries_on_429", 3),
+            initial_backoff_seconds=data.get("initial_backoff_seconds", 30),
+            max_backoff_seconds=data.get("max_backoff_seconds", 300),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_retries_on_429": self.max_retries_on_429,
+            "initial_backoff_seconds": self.initial_backoff_seconds,
+            "max_backoff_seconds": self.max_backoff_seconds,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Per-cycle throttle settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CycleConfig:
+    """Throttle knobs that control how much work each cycle does.
+
+    These prevent the squad from flooding the LLM API or overwhelming a
+    repo with simultaneous PRs when a large backlog is present.
+
+    Attributes:
+        max_new_tickets_per_cycle:  Cap on newly-triaged tickets per cycle.
+                                    Oldest/highest-severity tickets are
+                                    processed first; the rest wait for the
+                                    next cycle.
+        max_investigations_per_cycle: Max tickets sent to InvestigatorAgent
+                                    per cycle (Claude CLI calls — expensive).
+        max_developments_per_cycle: Max tickets sent to DeveloperAgent per
+                                    cycle.
+        max_open_investigating:     Hard cap on tickets allowed to be in
+                                    INVESTIGATING state simultaneously.
+                                    New investigations are skipped when this
+                                    limit is reached.
+        severity_filter:            Only triage/investigate tickets at or
+                                    above this severity.
+                                    Values: "low"|"medium"|"high"|"critical"
+    """
+
+    max_new_tickets_per_cycle: int = 20
+    max_investigations_per_cycle: int = 5
+    max_developments_per_cycle: int = 2
+    max_open_investigating: int = 3
+    severity_filter: str = "high"   # Ignore tickets below this severity
+    max_investigation_workers: int = 8  # Thread-pool size for parallel investigations
+    max_reinvestigations: int = 1   # Max re-investigation attempts after developer failure
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CycleConfig":
+        return cls(
+            max_new_tickets_per_cycle=data.get("max_new_tickets_per_cycle", 20),
+            max_investigations_per_cycle=data.get("max_investigations_per_cycle", 5),
+            max_developments_per_cycle=data.get("max_developments_per_cycle", 2),
+            max_open_investigating=data.get("max_open_investigating", 3),
+            severity_filter=data.get("severity_filter", "high"),
+            max_investigation_workers=data.get("max_investigation_workers", 8),
+            max_reinvestigations=data.get("max_reinvestigations", 1),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_new_tickets_per_cycle": self.max_new_tickets_per_cycle,
+            "max_investigations_per_cycle": self.max_investigations_per_cycle,
+            "max_developments_per_cycle": self.max_developments_per_cycle,
+            "max_open_investigating": self.max_open_investigating,
+            "severity_filter": self.severity_filter,
+            "max_investigation_workers": self.max_investigation_workers,
+            "max_reinvestigations": self.max_reinvestigations,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent fallback settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FallbackAgentConfig:
+    """Configuration for a fallback coding agent used when the primary is rate-limited.
+
+    Each entry defines a CLI agent that can be invoked as an alternative
+    to Claude Code when rate limits are hit.
+
+    Attributes:
+        name:       Human-readable agent name.
+        command:    Path to the CLI binary (e.g. ``/usr/bin/gemini``).
+        args_template: CLI arguments.  ``{prompt}`` and ``{model}`` are substituted.
+        default_model: Default model for this agent.
+        enabled:    Whether this fallback is active.
+        priority:   Selection priority (lower = preferred).
+        timeout:    Default timeout in seconds.
+        prompt_via_stdin: If True, send prompt via stdin rather than args.
+        skills:     List of skill IDs this agent can handle.
+    """
+
+    name: str = ""
+    command: str = ""
+    args_template: List[str] = field(default_factory=list)
+    default_model: str = ""
+    enabled: bool = False
+    priority: int = 100
+    timeout: int = 120
+    prompt_via_stdin: bool = False
+    skills: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FallbackAgentConfig":
+        return cls(
+            name=data.get("name", ""),
+            command=data.get("command", ""),
+            args_template=data.get("args_template", []),
+            default_model=data.get("default_model", ""),
+            enabled=data.get("enabled", False),
+            priority=data.get("priority", 100),
+            timeout=data.get("timeout", 120),
+            prompt_via_stdin=data.get("prompt_via_stdin", False),
+            skills=data.get("skills", []),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "command": self.command,
+            "args_template": self.args_template,
+            "default_model": self.default_model,
+            "enabled": self.enabled,
+            "priority": self.priority,
+            "timeout": self.timeout,
+            "prompt_via_stdin": self.prompt_via_stdin,
+            "skills": self.skills,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Semantic memory settings
 # ---------------------------------------------------------------------------
 
@@ -177,6 +338,10 @@ class MemoryConfig:
     top_k: int = 5
     similarity_floor: float = 0.75
     store_on_investigation_complete: bool = True
+    auto_resolve_threshold: float = 0.90
+    cluster_threshold: float = 0.85
+    dedup_threshold: float = 0.92
+    similarity_edge_threshold: float = 0.80
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MemoryConfig":
@@ -189,6 +354,10 @@ class MemoryConfig:
                 "store_on_investigation_complete",
                 True,
             ),
+            auto_resolve_threshold=data.get("auto_resolve_threshold", 0.90),
+            cluster_threshold=data.get("cluster_threshold", 0.85),
+            dedup_threshold=data.get("dedup_threshold", 0.92),
+            similarity_edge_threshold=data.get("similarity_edge_threshold", 0.80),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -198,6 +367,86 @@ class MemoryConfig:
             "top_k": self.top_k,
             "similarity_floor": self.similarity_floor,
             "store_on_investigation_complete": self.store_on_investigation_complete,
+            "auto_resolve_threshold": self.auto_resolve_threshold,
+            "cluster_threshold": self.cluster_threshold,
+            "dedup_threshold": self.dedup_threshold,
+            "similarity_edge_threshold": self.similarity_edge_threshold,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Agent timing settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AgentTimingConfig:
+    """Timeout and TTL settings for agent operations."""
+
+    investigation_timeout: int = 300
+    opus_timeout: int = 600
+    agent_registry_ttl: int = 300
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "AgentTimingConfig":
+        return cls(
+            investigation_timeout=data.get("investigation_timeout", 300),
+            opus_timeout=data.get("opus_timeout", 600),
+            agent_registry_ttl=data.get("agent_registry_ttl", 300),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "investigation_timeout": self.investigation_timeout,
+            "opus_timeout": self.opus_timeout,
+            "agent_registry_ttl": self.agent_registry_ttl,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Job scheduler settings
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SchedulerConfig:
+    """Job scheduler configuration."""
+    enabled: bool = False
+    tick_interval_seconds: int = 30
+    max_workers: int = 3
+    job_store_path: str = "data/swe_team/jobs.json"
+    peak_start_hour: int = 13
+    peak_end_hour: int = 19
+    peak_days: str = "0,1,2,3,4"
+    default_jobs: list = field(default_factory=list)
+
+
+@dataclass
+class RoutingConfig:
+    """External agent routing configuration for TriageAgent."""
+
+    external_agents_enabled: bool = False
+    complexity_threshold: int = 50  # error_log lines to trigger external routing
+    capability_map: dict = field(default_factory=lambda: {
+        "investigation": "gemini",
+        "code_generation": "opencode",
+    })
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RoutingConfig":
+        cap = d.get("capability_map", {})
+        return cls(
+            external_agents_enabled=bool(d.get("external_agents_enabled", False)),
+            complexity_threshold=int(d.get("complexity_threshold", 50)),
+            capability_map=cap if cap else {
+                "investigation": "gemini",
+                "code_generation": "opencode",
+            },
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "external_agents_enabled": self.external_agents_enabled,
+            "complexity_threshold": self.complexity_threshold,
+            "capability_map": self.capability_map,
         }
 
 
@@ -214,12 +463,23 @@ class SWETeamConfig:
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     models: ModelConfig = field(default_factory=ModelConfig)
+    rate_limits: RateLimitConfig = field(default_factory=RateLimitConfig)
+    cycle: CycleConfig = field(default_factory=CycleConfig)
+    fallback_agents: List[FallbackAgentConfig] = field(default_factory=list)
+    timing: AgentTimingConfig = field(default_factory=AgentTimingConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    throttle: ThrottleConfig = field(default_factory=ThrottleConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
+    repos: List[Dict[str, Any]] = field(default_factory=list)
     ticket_store_path: str = "data/swe_team/tickets.json"
     a2a_hub_url: str = "http://localhost:18790"
     enabled: bool = False
     team_id: str = "default"
     github_account: str = ""
     regression_window_hours: int = 24
+    auto_accept_invites: bool = False
+    invite_allowlist: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SWETeamConfig":
@@ -230,12 +490,30 @@ class SWETeamConfig:
         mon = MonitorConfig.from_dict(data.get("monitor", {}))
         memory = MemoryConfig.from_dict(data.get("memory", {}))
         models = ModelConfig.from_dict(data.get("models", {}))
+        rate_limits = RateLimitConfig.from_dict(data.get("rate_limits", {}))
+        cycle = CycleConfig.from_dict(data.get("cycle", {}))
+        fallbacks = [
+            FallbackAgentConfig.from_dict(f)
+            for f in data.get("fallback_agents", [])
+        ]
+        timing = AgentTimingConfig.from_dict(data.get("timing", {}))
+        throttle = ThrottleConfig.from_dict(data.get("throttle", {}))
+        execution = ExecutionConfig.from_dict(data.get("execution", {}))
+        routing = RoutingConfig.from_dict(data.get("routing", {}))
         return cls(
             agents=agents,
             governance=gov,
             monitor=mon,
             memory=memory,
             models=models,
+            rate_limits=rate_limits,
+            cycle=cycle,
+            fallback_agents=fallbacks,
+            timing=timing,
+            throttle=throttle,
+            execution=execution,
+            routing=routing,
+            repos=data.get("repos", []),
             ticket_store_path=data.get(
                 "ticket_store_path", "data/swe_team/tickets.json"
             ),
@@ -244,6 +522,8 @@ class SWETeamConfig:
             team_id=data.get("team_id", "default"),
             github_account=data.get("github_account", ""),
             regression_window_hours=data.get("regression_window_hours", 24),
+            auto_accept_invites=data.get("auto_accept_invites", False),
+            invite_allowlist=data.get("invite_allowlist") or [],
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -253,12 +533,20 @@ class SWETeamConfig:
             "monitor": self.monitor.to_dict(),
             "memory": self.memory.to_dict(),
             "models": self.models.to_dict(),
+            "rate_limits": self.rate_limits.to_dict(),
+            "cycle": self.cycle.to_dict(),
+            "fallback_agents": [f.to_dict() for f in self.fallback_agents],
+            "timing": self.timing.to_dict(),
+            "execution": self.execution.to_dict(),
+            "repos": self.repos,
             "ticket_store_path": self.ticket_store_path,
             "a2a_hub_url": self.a2a_hub_url,
             "enabled": self.enabled,
             "team_id": self.team_id,
             "github_account": self.github_account,
             "regression_window_hours": self.regression_window_hours,
+            "auto_accept_invites": self.auto_accept_invites,
+            "invite_allowlist": self.invite_allowlist,
         }
 
     def get_agents_by_role(self, role: AgentRole) -> List[SWEAgentConfig]:
@@ -284,6 +572,20 @@ def load_config(path: Optional[str] = None) -> SWETeamConfig:
     else:
         logger.info("SWE team config %s not found — using defaults", p)
         config = SWETeamConfig()
+
+    # Scheduler section
+    sched_raw = raw.get("scheduler", {}) if p.is_file() else {}
+    if sched_raw:
+        config.scheduler = SchedulerConfig(
+            enabled=sched_raw.get("enabled", False),
+            tick_interval_seconds=sched_raw.get("tick_interval_seconds", 30),
+            max_workers=sched_raw.get("max_workers", 3),
+            job_store_path=sched_raw.get("job_store_path", "data/swe_team/jobs.json"),
+            peak_start_hour=sched_raw.get("peak_start_hour", 13),
+            peak_end_hour=sched_raw.get("peak_end_hour", 19),
+            peak_days=str(sched_raw.get("peak_days", "0,1,2,3,4")),
+            default_jobs=sched_raw.get("default_jobs", []),
+        )
 
     # Environment variable overrides
     env_enabled = os.environ.get("SWE_TEAM_ENABLED")
