@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: docker/dashboard/Dockerfile
+    image: swe-squad-dashboard:latest
+    container_name: swe-squad-dashboard
+    ports:
+      - "8888:8888"
+    volumes:
+      - ../../data/swe_team:/app/data/swe_team
+      - ../../logs:/app/logs
+      - ../../config:/app/config:ro
+    env_file:
+      - ../../.env
+    environment:
+      - SWE_TEAM_CONFIG=/app/config/swe_team.yaml
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8888/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
