@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 # ── Project bootstrap ─────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ logging.logAsyncioTasks = False
 
 from src.swe_team.config import load_config
 from src.swe_team.investigator import InvestigatorAgent
-from src.swe_team.models import GovernanceVerdict, SWETicket, TicketSeverity, TicketStatus
+from src.swe_team.models import GovernanceVerdict, SWETicket, TicketSeverity, TicketStatus, TicketType
 from src.swe_team.monitor_agent import MonitorAgent
 from src.swe_team.triage_agent import TriageAgent
 from src.swe_team.ralph_wiggum import RalphWiggumGate
@@ -301,29 +301,31 @@ def _fingerprint_in_recent_logs(fingerprint: str, monitor: "MonitorAgent") -> bo
     return fingerprint in fresh_fps
 
 
-def fetch_github_tickets(store, github_account: str = "") -> List[SWETicket]:
-    """Fetch open GitHub issues assigned to the team's GitHub account."""
-    if not github_account:
-        logger.debug("No github_account configured — skipping GitHub issue fetch")
-        return []
+def _fetch_github_issues_for_repo(
+    repo: str, github_account: str, store, known_fps: set,
+) -> List[SWETicket]:
+    """Fetch open issues assigned to *github_account* from a single *repo*."""
     try:
-        result = subprocess.run(
-            ["gh", "issue", "list", "--state", "open", "--assignee", github_account,
-             "--json", "number,title,body,labels", "--limit", "20"],
-            capture_output=True, text=True, timeout=15,
-        )
+        cmd = [
+            "gh", "issue", "list",
+            "--repo", repo,
+            "--state", "open",
+            "--assignee", github_account,
+            "--json", "number,title,body,labels",
+            "--limit", "20",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
+            logger.debug("gh issue list failed for %s: %s", repo, result.stderr.strip())
             return []
 
         issues = json.loads(result.stdout)
         new_tickets: List[SWETicket] = []
         for issue in issues:
-            # Check if we already have a ticket for this issue
-            fingerprint = f"gh-issue-{issue['number']}"
-            if fingerprint in store.known_fingerprints:
+            fingerprint = f"gh-issue-{repo}-{issue['number']}"
+            if fingerprint in known_fps or fingerprint in store.known_fingerprints:
                 continue
 
-            # Detect severity from labels and title
             label_names = [l.get("name", "").lower() for l in issue.get("labels", [])]
             title_lower = issue["title"].lower()
             if any("critical" in l or "p0" in l for l in label_names) or "p0" in title_lower:
@@ -333,27 +335,73 @@ def fetch_github_tickets(store, github_account: str = "") -> List[SWETicket]:
             elif any("low" in l for l in label_names) or "p3" in title_lower:
                 severity = TicketSeverity.LOW
             else:
-                severity = TicketSeverity.HIGH  # Default for assigned issues
+                severity = TicketSeverity.HIGH
 
-            # Detect module from labels
             module = "unknown"
             for l in label_names:
                 if "module:" in l:
                     module = l.replace("module:", "").strip()
                     break
 
+            # Detect ticket type from labels and title
+            ticket_type = TicketType.BUG  # default
+            if "enhancement" in label_names or "feature" in label_names:
+                ticket_type = TicketType.ENHANCEMENT
+            elif any(tag in title_lower for tag in ("[foundation]", "[feature]", "[integration]")):
+                ticket_type = TicketType.FEATURE
+
             ticket = SWETicket(
                 title=f"[GH-{issue['number']}] {issue['title'][:100]}",
                 description=(issue.get("body") or "")[:500],
                 severity=severity,
                 source_module=module,
-                metadata={"github_issue": issue["number"], "fingerprint": fingerprint},
+                labels=label_names,
+                ticket_type=ticket_type,
+                metadata={
+                    "github_issue": issue["number"],
+                    "fingerprint": fingerprint,
+                    "repo": repo,
+                },
             )
             new_tickets.append(ticket)
+            known_fps.add(fingerprint)
         return new_tickets
     except Exception:
-        logger.exception("Failed to fetch GitHub issues")
+        logger.exception("Failed to fetch GitHub issues for %s", repo)
         return []
+
+
+def fetch_github_tickets(
+    store,
+    github_account: str = "",
+    repos: Optional[List[str]] = None,
+) -> List[SWETicket]:
+    """Fetch open GitHub issues assigned to the team's GitHub account.
+
+    When *repos* is provided, iterates over each repo.  Otherwise falls back
+    to the single ``SWE_GITHUB_REPO`` environment variable for backward
+    compatibility.
+    """
+    if not github_account:
+        logger.debug("No github_account configured — skipping GitHub issue fetch")
+        return []
+
+    if not repos:
+        single = os.environ.get("SWE_GITHUB_REPO", "")
+        repos = [single] if single else []
+
+    if not repos:
+        logger.debug("No repos configured — skipping GitHub issue fetch")
+        return []
+
+    all_tickets: List[SWETicket] = []
+    seen_fps: set = set()
+    for repo in repos:
+        tickets = _fetch_github_issues_for_repo(repo, github_account, store, seen_fps)
+        all_tickets.extend(tickets)
+        logger.info("Fetched %d assigned issues from %s", len(tickets), repo)
+
+    return all_tickets
 
 
 def setup_logging(verbose: bool = False) -> None:

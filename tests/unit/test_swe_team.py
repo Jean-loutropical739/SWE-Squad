@@ -2153,13 +2153,15 @@ class TestFetchGithubTickets:
         mock_result = type("R", (), {"returncode": 0, "stdout": gh_output, "stderr": ""})()
 
         with patch("scripts.ops.swe_team_runner.subprocess.run", return_value=mock_result):
-            tickets = runner.fetch_github_tickets(store, github_account="test-bot")
+            tickets = runner.fetch_github_tickets(
+                store, github_account="test-bot", repos=["test-org/test-repo"]
+            )
 
         assert len(tickets) == 1
         assert tickets[0].title == "[GH-42] Fix scraper timeout"
         assert tickets[0].severity == TicketSeverity.HIGH
         assert tickets[0].metadata["github_issue"] == 42
-        assert tickets[0].metadata["fingerprint"] == "gh-issue-42"
+        assert tickets[0].metadata["fingerprint"] == "gh-issue-test-org/test-repo-42"
 
     def test_fetch_github_tickets_dedup(self, tmp_path):
         import scripts.ops.swe_team_runner as runner
@@ -2169,7 +2171,7 @@ class TestFetchGithubTickets:
         existing = SWETicket(
             title="[GH-42] existing",
             description="already tracked",
-            metadata={"fingerprint": "gh-issue-42"},
+            metadata={"fingerprint": "gh-issue-test-org/test-repo-42"},
         )
         store.add(existing)
 
@@ -2179,7 +2181,9 @@ class TestFetchGithubTickets:
         mock_result = type("R", (), {"returncode": 0, "stdout": gh_output, "stderr": ""})()
 
         with patch("scripts.ops.swe_team_runner.subprocess.run", return_value=mock_result):
-            tickets = runner.fetch_github_tickets(store, github_account="test-bot")
+            tickets = runner.fetch_github_tickets(
+                store, github_account="test-bot", repos=["test-org/test-repo"]
+            )
 
         assert len(tickets) == 0
 
@@ -2190,7 +2194,9 @@ class TestFetchGithubTickets:
         mock_result = type("R", (), {"returncode": 1, "stdout": "", "stderr": "auth required"})()
 
         with patch("scripts.ops.swe_team_runner.subprocess.run", return_value=mock_result):
-            tickets = runner.fetch_github_tickets(store, github_account="test-bot")
+            tickets = runner.fetch_github_tickets(
+                store, github_account="test-bot", repos=["test-org/test-repo"]
+            )
 
         assert tickets == []
 
@@ -2200,7 +2206,9 @@ class TestFetchGithubTickets:
         store = TicketStore(str(tmp_path / "tickets.json"))
 
         with patch("scripts.ops.swe_team_runner.subprocess.run", side_effect=Exception("network")):
-            tickets = runner.fetch_github_tickets(store, github_account="test-bot")
+            tickets = runner.fetch_github_tickets(
+                store, github_account="test-bot", repos=["test-org/test-repo"]
+            )
 
         assert tickets == []
 
@@ -2214,7 +2222,9 @@ class TestFetchGithubTickets:
         mock_result = type("R", (), {"returncode": 0, "stdout": gh_output, "stderr": ""})()
 
         with patch("scripts.ops.swe_team_runner.subprocess.run", return_value=mock_result):
-            tickets = runner.fetch_github_tickets(store, github_account="test-bot")
+            tickets = runner.fetch_github_tickets(
+                store, github_account="test-bot", repos=["test-org/test-repo"]
+            )
 
         assert len(tickets) == 1
         assert tickets[0].description == ""

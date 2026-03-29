@@ -56,6 +56,9 @@ class PreflightCheck:
         Expected repository root path.  Skipped when *None*.
     required_env_vars:
         List of environment variable names that must be set.
+    sandbox_paths:
+        List of allowed sandbox directory paths.  When set, any agent
+        working directory must be inside one of these paths.
     """
 
     def __init__(
@@ -66,6 +69,7 @@ class PreflightCheck:
         expected_github_account: Optional[str] = None,
         expected_repo_root: Optional[Path] = None,
         required_env_vars: Optional[List[str]] = None,
+        sandbox_paths: Optional[List[Path]] = None,
     ) -> None:
         self._expected_git_name = expected_git_name
         self._expected_git_email = expected_git_email
@@ -74,6 +78,7 @@ class PreflightCheck:
         self._required_env_vars = (
             required_env_vars if required_env_vars is not None else REQUIRED_ENV_VARS
         )
+        self._sandbox_paths: List[Path] = sandbox_paths or []
 
     # ------------------------------------------------------------------
     # Public API
@@ -87,6 +92,10 @@ class PreflightCheck:
         failures.extend(self.check_working_directory())
         failures.extend(self.check_github_auth())
         failures.extend(self.check_env_vars())
+        failures.extend(self.check_sandbox_boundary())
+
+        # Non-fatal warning checks (do not count as failures)
+        self._warn_base_llm_config()
 
         passed = len(failures) == 0
         result = PreflightResult(passed=passed, failures=failures)
@@ -140,6 +149,7 @@ class PreflightCheck:
                 capture_output=True,
                 text=True,
                 timeout=5,
+                cwd=self._expected_repo_root,
             )
             if result.returncode != 0:
                 failures.append("Not inside a git repository")
@@ -193,6 +203,46 @@ class PreflightCheck:
             if not os.environ.get(var):
                 failures.append(f"Required env var '{var}' is not set")
         return failures
+
+    def check_sandbox_boundary(self) -> List[str]:
+        """Verify the working directory is inside an allowed sandbox path."""
+        if not self._sandbox_paths or self._expected_repo_root is None:
+            return []
+
+        failures: List[str] = []
+        resolved_cwd = self._expected_repo_root.resolve()
+
+        for sandbox in self._sandbox_paths:
+            try:
+                resolved_cwd.relative_to(sandbox.resolve())
+                return []
+            except ValueError:
+                continue
+
+        failures.append(
+            f"Working directory '{resolved_cwd}' is outside all configured "
+            f"sandbox paths: {[str(p) for p in self._sandbox_paths]}. "
+            f"Agents must work inside sandbox repos only."
+        )
+        return failures
+
+    def _warn_base_llm_config(self) -> None:
+        """Emit a WARNING when BASE_LLM_API_URL is set but API key is missing.
+
+        This is a non-fatal advisory: the system will still run, but semantic
+        memory (embedding + extraction) will be unavailable.
+        """
+        api_url = os.environ.get("BASE_LLM_API_URL", "").strip()
+        api_key = (
+            os.environ.get("BASE_LLM_API_KEY", "").strip()
+            or os.environ.get("EMBEDDING_API_KEY", "").strip()
+        )
+        if api_url and not api_key:
+            logger.warning(
+                "BASE_LLM_API_URL is set but BASE_LLM_API_KEY is empty — "
+                "semantic memory (embeddings + extraction) will be disabled. "
+                "Set BASE_LLM_API_KEY to enable it."
+            )
 
     # ------------------------------------------------------------------
     # Helpers
