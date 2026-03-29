@@ -317,7 +317,8 @@ class TestProgressLog:
 
 
 class TestInvestigatorModelSelection:
-    def test_critical_uses_t1_heavy(self):
+    def test_critical_first_attempt_uses_t2_standard(self):
+        """CRITICAL first attempt uses Sonnet (t2_standard) — cheap-first strategy."""
         from src.swe_team.investigator import InvestigatorAgent
 
         mc = ModelConfig(t1_heavy="my-opus", t2_standard="my-sonnet")
@@ -326,6 +327,20 @@ class TestInvestigatorModelSelection:
             title="Critical bug",
             description="desc",
             severity=TicketSeverity.CRITICAL,
+        )
+        assert agent._select_model(ticket) == "my-sonnet"
+
+    def test_critical_retry_escalates_to_t1_heavy(self):
+        """CRITICAL retry after failed investigation escalates to Opus (t1_heavy)."""
+        from src.swe_team.investigator import InvestigatorAgent
+
+        mc = ModelConfig(t1_heavy="my-opus", t2_standard="my-sonnet")
+        agent = InvestigatorAgent(model_config=mc)
+        ticket = SWETicket(
+            title="Critical bug",
+            description="desc",
+            severity=TicketSeverity.CRITICAL,
+            metadata={"investigation": {"status": "failed"}},
         )
         assert agent._select_model(ticket) == "my-opus"
 
@@ -355,6 +370,7 @@ class TestInvestigatorModelSelection:
         assert agent._select_model(ticket) == "my-opus"
 
     def test_no_model_config_falls_back(self):
+        """No model_config: CRITICAL first attempt uses default T2 (sonnet)."""
         from src.swe_team.investigator import InvestigatorAgent
 
         agent = InvestigatorAgent()
@@ -363,38 +379,38 @@ class TestInvestigatorModelSelection:
             description="desc",
             severity=TicketSeverity.CRITICAL,
         )
-        assert agent._select_model(ticket) == "opus"
+        assert agent._select_model(ticket) == "sonnet"
 
 
 class TestDeveloperModelSelection:
     def test_critical_uses_t1_heavy(self):
         from src.swe_team.developer import DeveloperAgent
 
-        mc = ModelConfig(t1_heavy="dev-opus", t2_standard="dev-sonnet")
+        mc = ModelConfig(t1_heavy="opus", t2_standard="sonnet")
         agent = DeveloperAgent(model_config=mc)
         ticket = SWETicket(
             title="Critical bug",
             description="desc",
             severity=TicketSeverity.CRITICAL,
         )
-        assert agent._select_model(ticket) == "dev-opus"
+        assert agent._select_model(ticket) == "opus"
 
     def test_high_uses_t2_standard(self):
         from src.swe_team.developer import DeveloperAgent
 
-        mc = ModelConfig(t1_heavy="dev-opus", t2_standard="dev-sonnet")
+        mc = ModelConfig(t1_heavy="opus", t2_standard="sonnet")
         agent = DeveloperAgent(model_config=mc)
         ticket = SWETicket(
             title="High bug",
             description="desc",
             severity=TicketSeverity.HIGH,
         )
-        assert agent._select_model(ticket) == "dev-sonnet"
+        assert agent._select_model(ticket) == "sonnet"
 
     def test_escalation_after_failures(self):
         from src.swe_team.developer import DeveloperAgent
 
-        mc = ModelConfig(t1_heavy="dev-opus", t2_standard="dev-sonnet")
+        mc = ModelConfig(t1_heavy="opus", t2_standard="sonnet")
         agent = DeveloperAgent(model_config=mc)
         ticket = SWETicket(
             title="High bug",
@@ -405,7 +421,7 @@ class TestDeveloperModelSelection:
                 {"result": "fail"},
             ]},
         )
-        assert agent._select_model(ticket) == "dev-opus"
+        assert agent._select_model(ticket) == "opus"
 
     def test_no_model_config_falls_back(self):
         from src.swe_team.developer import DeveloperAgent

@@ -9,10 +9,13 @@ used to coordinate the autonomous development lifecycle:
 from __future__ import annotations
 
 import enum
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
+
+_MODEL_T2 = os.environ.get("SWE_MODEL_T2", "sonnet")
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +34,8 @@ class TicketStatus(enum.Enum):
     """Lifecycle states of an SWE ticket."""
     OPEN = "open"
     TRIAGED = "triaged"
+    NEEDS_INFO = "needs_info"
+    BLOCKED = "blocked"
     ACKNOWLEDGED = "acknowledged"
     INVESTIGATING = "investigating"
     INVESTIGATION_COMPLETE = "investigation_complete"
@@ -42,6 +47,20 @@ class TicketStatus(enum.Enum):
     RESOLVED = "resolved"
     ROLLED_BACK = "rolled_back"
     CLOSED = "closed"
+    FAILED = "failed"  # All dev attempts exhausted — requires human review
+
+
+class TicketType(str, enum.Enum):
+    """Classification of what kind of work this ticket requires."""
+    BUG = "bug"
+    FEATURE = "feature"
+    ENHANCEMENT = "enhancement"
+    INFRASTRUCTURE = "infrastructure"
+    DOCUMENTATION = "documentation"
+    QUESTION = "question"
+    SECURITY = "security"
+    REGRESSION = "regression"
+    UNKNOWN = "unknown"
 
 
 class AgentRole(enum.Enum):
@@ -85,9 +104,12 @@ class SWETicket:
     )
     assigned_to: Optional[str] = None
     labels: List[str] = field(default_factory=list)
+    ticket_type: TicketType = field(default_factory=lambda: TicketType.UNKNOWN)
     source_module: Optional[str] = None
     error_log: Optional[str] = None
     related_tickets: List[str] = field(default_factory=list)
+    blocked_by: List[str] = field(default_factory=list)
+    blocking: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # Lifecycle bookkeeping
@@ -96,6 +118,14 @@ class SWETicket:
     test_results: Optional[Dict[str, Any]] = None
     deployment_id: Optional[str] = None
     rollback_reason: Optional[str] = None
+
+    # Session tracking — mirrors metadata["claude_session_id"] / metadata["dev_session_id"]
+    investigation_session_id: Optional[str] = None
+    development_session_id: Optional[str] = None
+
+    def is_blocked(self) -> bool:
+        """Return True if this ticket has unresolved blockers."""
+        return len(self.blocked_by) > 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -108,15 +138,20 @@ class SWETicket:
             "updated_at": self.updated_at,
             "assigned_to": self.assigned_to,
             "labels": self.labels,
+            "ticket_type": self.ticket_type.value,
             "source_module": self.source_module,
             "error_log": self.error_log,
             "related_tickets": self.related_tickets,
+            "blocked_by": self.blocked_by,
+            "blocking": self.blocking,
             "metadata": self.metadata,
             "investigation_report": self.investigation_report,
             "proposed_fix": self.proposed_fix,
             "test_results": self.test_results,
             "deployment_id": self.deployment_id,
             "rollback_reason": self.rollback_reason,
+            "investigation_session_id": self.investigation_session_id,
+            "development_session_id": self.development_session_id,
         }
 
     @classmethod
@@ -135,19 +170,88 @@ class SWETicket:
             ),
             assigned_to=data.get("assigned_to"),
             labels=data.get("labels", []),
+            ticket_type=TicketType(data.get("ticket_type", "unknown")),
             source_module=data.get("source_module"),
             error_log=data.get("error_log"),
             related_tickets=data.get("related_tickets", []),
-            metadata=data.get("metadata", {}),
+            blocked_by=data.get("blocked_by", []),
+            blocking=data.get("blocking", []),
+            metadata=data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else (
+                __import__("json").loads(data["metadata"]) if isinstance(data.get("metadata"), str) and data["metadata"] else {}
+            ),
             investigation_report=data.get("investigation_report"),
             proposed_fix=data.get("proposed_fix"),
             test_results=data.get("test_results"),
             deployment_id=data.get("deployment_id"),
             rollback_reason=data.get("rollback_reason"),
+            investigation_session_id=data.get("investigation_session_id"),
+            development_session_id=data.get("development_session_id"),
         )
 
-    def transition(self, new_status: TicketStatus) -> None:
-        """Move the ticket to *new_status* and touch the timestamp."""
+    # Resolution bypass reasons that satisfy the audit gate without a full report.
+    # Any ticket resolved with one of these notes is considered legitimately closed.
+    RESOLUTION_BYPASS_REASONS: ClassVar[set] = {
+        "false_regression",
+        "duplicate",
+        "already_fixed_externally",
+        "not_reproducible",
+        "wont_fix_approved",
+        "manual_override",
+        "fix_succeeded",
+    }
+
+    def resolution_audit(self) -> tuple[bool, str]:
+        """Check whether this ticket may legitimately be closed as RESOLVED.
+
+        Returns (ok, reason).  ``ok=False`` means the transition should be
+        blocked; ``reason`` is a human-readable explanation.
+
+        Rules
+        -----
+        1. A recognised bypass note in ``metadata['resolution_note']`` always
+           permits closure regardless of report or attempts.
+        2. Otherwise the ticket must have an investigation report of at least
+           200 characters.
+        3. HIGH / CRITICAL tickets additionally need at least one fix attempt
+           OR an explicit bypass note.
+        """
+        note = str(self.metadata.get("resolution_note", "")).lower()
+        if any(r in note for r in self.RESOLUTION_BYPASS_REASONS):
+            return True, f"bypass: {note[:80]}"
+
+        report = self.investigation_report or ""
+        if len(report) < 200:
+            return False, (
+                f"investigation_report too short ({len(report)} chars, need ≥200). "
+                "Investigate first or set metadata['resolution_note'] to a bypass reason: "
+                + ", ".join(sorted(self.RESOLUTION_BYPASS_REASONS))
+            )
+
+        if self.severity in (TicketSeverity.HIGH, TicketSeverity.CRITICAL):
+            attempts = self.metadata.get("attempts", [])
+            if not attempts:
+                return False, (
+                    f"{self.severity.value.upper()} ticket requires ≥1 fix attempt before RESOLVED. "
+                    "Attempts list is empty. Run developer agent or set resolution_note bypass."
+                )
+
+        return True, "audit passed"
+
+    def transition(self, new_status: TicketStatus, *, force: bool = False) -> None:
+        """Move the ticket to *new_status* and touch the timestamp.
+
+        Raises ``ValueError`` if transitioning to RESOLVED without passing
+        the resolution audit.  To force-close, set
+        ``ticket.metadata['resolution_note']`` to a bypass reason first,
+        or pass ``force=True`` to skip the audit (use only in tests).
+        """
+        if new_status == TicketStatus.RESOLVED and not force:
+            ok, reason = self.resolution_audit()
+            if not ok:
+                raise ValueError(
+                    f"Resolution blocked for {self.ticket_id} ({self.severity.value} / "
+                    f"{self.status.value}): {reason}"
+                )
         self.status = new_status
         self.updated_at = datetime.now(timezone.utc).isoformat()
 
@@ -187,7 +291,7 @@ class SWEAgentConfig:
             name=data["name"],
             role=AgentRole(data["role"]),
             description=data.get("description", ""),
-            model=data.get("model", "sonnet"),
+            model=data.get("model", _MODEL_T2),
             tools=data.get("tools", []),
             max_concurrent_tasks=data.get("max_concurrent_tasks", 1),
             enabled=data.get("enabled", False),
@@ -236,4 +340,176 @@ class StabilityReport:
             checked_at=data.get(
                 "checked_at", datetime.now(timezone.utc).isoformat()
             ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Graph Models
+# ---------------------------------------------------------------------------
+
+class EdgeType(enum.Enum):
+    """Types of knowledge graph edges between entities."""
+    SIMILAR = "similar"                    # Two tickets with high cosine similarity
+    TOUCHES_MODULE = "touches_module"      # Ticket/PR ↔ code module
+    BLOCKS = "blocks"                      # Ticket A blocks resolution of B
+    RESOLVES = "resolves"                  # PR resolves a ticket
+    CONFLICTS_WITH = "conflicts_with"      # Two PRs touching same files
+    CAUSED_REGRESSION = "caused_regression"  # PR caused a new ticket
+
+
+@dataclass
+class KnowledgeEdge:
+    """A directed relationship between two entities in the knowledge graph."""
+    source_id: str
+    target_id: str
+    edge_type: EdgeType
+    confidence: float = 0.0
+    discovered_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    discovered_by: str = ""       # 'embedding', 'fact_extraction', 'pr_sync', 'investigator'
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_id": self.source_id,
+            "target_id": self.target_id,
+            "edge_type": self.edge_type.value,
+            "confidence": self.confidence,
+            "discovered_at": self.discovered_at,
+            "discovered_by": self.discovered_by,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "KnowledgeEdge":
+        return cls(
+            source_id=data["source_id"],
+            target_id=data["target_id"],
+            edge_type=EdgeType(data.get("edge_type", "similar")),
+            confidence=float(data.get("confidence", 0.0)),
+            discovered_at=data.get("discovered_at", datetime.now(timezone.utc).isoformat()),
+            discovered_by=data.get("discovered_by", ""),
+            metadata=data.get("metadata", {}),
+        )
+
+
+@dataclass
+class CodeModule:
+    """A code module tracked in the knowledge graph."""
+    module_id: str                          # e.g. "security.py"
+    repo: str = ""                          # "owner/repo"
+    file_path: str = ""
+    last_seen: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "module_id": self.module_id,
+            "repo": self.repo,
+            "file_path": self.file_path,
+            "last_seen": self.last_seen,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CodeModule":
+        return cls(
+            module_id=data["module_id"],
+            repo=data.get("repo", ""),
+            file_path=data.get("file_path", ""),
+            last_seen=data.get("last_seen", datetime.now(timezone.utc).isoformat()),
+            metadata=data.get("metadata", {}),
+        )
+
+
+@dataclass
+class ResolutionCluster:
+    """A group of tickets sharing a root cause."""
+    cluster_id: str
+    root_cause: str = ""
+    primary_module: str = ""
+    ticket_ids: List[str] = field(default_factory=list)
+    status: str = "open"                    # 'open', 'investigating', 'resolved'
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cluster_id": self.cluster_id,
+            "root_cause": self.root_cause,
+            "primary_module": self.primary_module,
+            "ticket_ids": self.ticket_ids,
+            "status": self.status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ResolutionCluster":
+        return cls(
+            cluster_id=data["cluster_id"],
+            root_cause=data.get("root_cause", ""),
+            primary_module=data.get("primary_module", ""),
+            ticket_ids=data.get("ticket_ids", []),
+            status=data.get("status", "open"),
+            created_at=data.get("created_at", datetime.now(timezone.utc).isoformat()),
+            updated_at=data.get("updated_at", datetime.now(timezone.utc).isoformat()),
+            metadata=data.get("metadata", {}),
+        )
+
+
+@dataclass
+class PRNode:
+    """A GitHub pull request tracked in the knowledge graph."""
+    pr_id: str                              # "owner/repo#142"
+    repo: str = ""
+    number: int = 0
+    branch: str = ""
+    title: str = ""
+    status: str = "open"                    # 'open', 'merged', 'closed'
+    author: str = ""
+    files_changed: List[str] = field(default_factory=list)
+    ticket_ids: List[str] = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    merged_at: Optional[str] = None
+    review_status: str = "pending"          # 'pending', 'approved', 'changes_requested'
+    last_checked: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pr_id": self.pr_id,
+            "repo": self.repo,
+            "number": self.number,
+            "branch": self.branch,
+            "title": self.title,
+            "status": self.status,
+            "author": self.author,
+            "files_changed": self.files_changed,
+            "ticket_ids": self.ticket_ids,
+            "created_at": self.created_at,
+            "merged_at": self.merged_at,
+            "review_status": self.review_status,
+            "last_checked": self.last_checked,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PRNode":
+        return cls(
+            pr_id=data["pr_id"],
+            repo=data.get("repo", ""),
+            number=int(data.get("number", 0)),
+            branch=data.get("branch", ""),
+            title=data.get("title", ""),
+            status=data.get("status", "open"),
+            author=data.get("author", ""),
+            files_changed=data.get("files_changed", []),
+            ticket_ids=data.get("ticket_ids", []),
+            created_at=data.get("created_at", datetime.now(timezone.utc).isoformat()),
+            merged_at=data.get("merged_at"),
+            review_status=data.get("review_status", "pending"),
+            last_checked=data.get("last_checked", datetime.now(timezone.utc).isoformat()),
+            metadata=data.get("metadata", {}),
         )

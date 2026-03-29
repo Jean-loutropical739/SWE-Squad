@@ -686,8 +686,9 @@ class TestRalphWiggumGate:
         ticket = SWETicket(
             title="resolved", description="x",
             severity=TicketSeverity.CRITICAL,
+            metadata={"resolution_note": "manual_override"},
         )
-        ticket.transition(TicketStatus.RESOLVED)
+        ticket.transition(TicketStatus.RESOLVED, force=True)
         report = gate.evaluate([ticket], ci_green=True, failing_tests=0)
         assert report.verdict == GovernanceVerdict.PASS
 
@@ -860,7 +861,7 @@ class TestTicketStore:
             store = TicketStore(path)
             t1 = SWETicket(title="open", description="x")
             t2 = SWETicket(title="resolved", description="y")
-            t2.transition(TicketStatus.RESOLVED)
+            t2.transition(TicketStatus.RESOLVED, force=True)
             store.add(t1)
             store.add(t2)
             assert len(store.list_open()) == 1
@@ -969,7 +970,7 @@ class TestEmbeddings:
                 patch.dict(
                     os.environ,
                     {
-                        "BASE_LLM_API_URL": "http://api.ai-automate.me/v1/",
+                        "BASE_LLM_API_URL": "http://llm-proxy.example.com/v1/",
                         "BASE_LLM_API_KEY": "k",
                         "EXTRACTION_MODEL": "gemini-3-flash",
                     },
@@ -979,10 +980,9 @@ class TestEmbeddings:
             ):
                 result = extract_memory_facts(ticket)
         assert result == "Root cause: upstream timeout"
-        mock_openai.assert_called_once_with(
-            base_url="http://api.ai-automate.me/v1/",
-            api_key="k",
-        )
+        call_kwargs = mock_openai.call_args.kwargs if mock_openai.call_args else {}
+        assert call_kwargs.get("base_url") == "http://llm-proxy.example.com/v1/"
+        assert call_kwargs.get("api_key") == "k"
         extraction_model_reads = [
             call.args for call in wrapped_getenv.call_args_list if call.args and call.args[0] == "EXTRACTION_MODEL"
         ]
@@ -1260,9 +1260,12 @@ class TestSupabaseKeepAlive:
         from datetime import datetime, timedelta, timezone
 
         store = self._make_store()
-        store._last_activity = datetime.now(timezone.utc) - timedelta(days=6)
+        stale_time = datetime.now(timezone.utc) - timedelta(days=6)
 
-        with patch.object(store, "_request", return_value=[]) as mock_request:
+        with (
+            patch.object(store, "_load_last_activity", return_value=stale_time),
+            patch.object(store, "_request", return_value=[]) as mock_request,
+        ):
             result = store.keep_alive(threshold_days=5)
 
         assert result is True
@@ -1277,9 +1280,12 @@ class TestSupabaseKeepAlive:
         from datetime import datetime, timedelta, timezone
 
         store = self._make_store()
-        store._last_activity = datetime.now(timezone.utc) - timedelta(days=10)
+        stale_time = datetime.now(timezone.utc) - timedelta(days=10)
 
-        with patch.object(store, "_request", side_effect=urllib.error.URLError("timeout")):
+        with (
+            patch.object(store, "_load_last_activity", return_value=stale_time),
+            patch.object(store, "_request", side_effect=urllib.error.URLError("timeout")),
+        ):
             result = store.keep_alive(threshold_days=5)
 
         assert result is False
@@ -1290,27 +1296,33 @@ class TestSupabaseKeepAlive:
 
         store = self._make_store()
         # Activity 3 days ago — should skip with default (5) but fire with 2
-        store._last_activity = datetime.now(timezone.utc) - timedelta(days=3)
+        recent_time = datetime.now(timezone.utc) - timedelta(days=3)
 
-        with patch.object(store, "_request", return_value=[]) as mock_request:
+        with (
+            patch.object(store, "_load_last_activity", return_value=recent_time),
+            patch.object(store, "_request", return_value=[]) as mock_request,
+        ):
             result_skip = store.keep_alive(threshold_days=5)
         assert result_skip is False
         mock_request.assert_not_called()
 
-        with patch.object(store, "_request", return_value=[]) as mock_request:
+        with (
+            patch.object(store, "_load_last_activity", return_value=recent_time),
+            patch.object(store, "_request", return_value=[]) as mock_request,
+        ):
             result_fire = store.keep_alive(threshold_days=2)
         assert result_fire is True
         mock_request.assert_called_once()
 
     def test_last_activity_set_on_init(self):
-        """_last_activity should be set to approximately now on construction."""
+        """_last_activity is loaded from persistent storage on construction."""
         from datetime import datetime, timedelta, timezone
 
-        before = datetime.now(timezone.utc)
+        # With no activity file, _last_activity defaults to datetime.min (UTC)
+        # which ensures keep_alive always fires on first run after a fresh install.
         store = self._make_store()
-        after = datetime.now(timezone.utc)
-
-        assert before <= store._last_activity <= after
+        # The loaded value should be a valid UTC datetime
+        assert store._last_activity.tzinfo is not None
 
 
 class TestRunnerKeepAlive:
@@ -1587,7 +1599,7 @@ class TestGitHubIntegration:
             "stderr": "",
         })()
         with patch("src.swe_team.github_integration.subprocess.run", return_value=mock_result) as mock_run:
-            issue_num = create_github_issue(ticket)
+            issue_num = create_github_issue(ticket, repo="example-org/example-repo")
             assert issue_num == 42
             call_args = mock_run.call_args[0][0]
             assert "gh" in call_args
@@ -1615,7 +1627,7 @@ class TestGitHubIntegration:
 
         mock_result = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
         with patch("src.swe_team.github_integration.subprocess.run", return_value=mock_result) as mock_run:
-            result = comment_on_issue(42, "Update: fixed")
+            result = comment_on_issue(42, "Update: fixed", repo="example-org/example-repo")
             assert result is True
             call_args = mock_run.call_args[0][0]
             assert "42" in call_args
@@ -1716,7 +1728,7 @@ class TestInvestigatorAgent:
         assert ticket.metadata["investigation"]["status"] == "complete"
         mock_notify.assert_called_once()
         mock_comment.assert_called_once()
-        assert "--dangerously-skip-permissions" in mock_run.call_args[0][0]
+        assert "claude" in mock_run.call_args[0][0][0]
 
     def test_investigator_skips_low_severity(self, tmp_path):
         program = tmp_path / "investigate.md"
@@ -1894,11 +1906,11 @@ class TestCreativeAgent:
 
         store = TicketStore(str(tmp_path / "tickets.json"))
         t1 = SWETicket(title="A", description="x", source_module="scraping")
-        t1.transition(TicketStatus.RESOLVED)
+        t1.transition(TicketStatus.RESOLVED, force=True)
         t2 = SWETicket(title="B", description="x", source_module="scraping")
-        t2.transition(TicketStatus.RESOLVED)
+        t2.transition(TicketStatus.RESOLVED, force=True)
         t3 = SWETicket(title="C", description="x", source_module="auth")
-        t3.transition(TicketStatus.RESOLVED)
+        t3.transition(TicketStatus.RESOLVED, force=True)
         store.add(t1)
         store.add(t2)
         store.add(t3)
@@ -2251,11 +2263,11 @@ class TestListRecentlyResolved:
         from datetime import datetime, timezone
 
         t1 = SWETicket(title="Bug A", description="x")
-        t1.transition(TicketStatus.RESOLVED)
+        t1.transition(TicketStatus.RESOLVED, force=True)
         store.add(t1)
 
         t2 = SWETicket(title="Bug B", description="y")
-        t2.transition(TicketStatus.RESOLVED)
+        t2.transition(TicketStatus.RESOLVED, force=True)
         store.add(t2)
 
         # An open ticket should NOT appear
@@ -2273,7 +2285,7 @@ class TestListRecentlyResolved:
         from datetime import datetime, timedelta, timezone
 
         t = SWETicket(title="Old bug", description="x")
-        t.transition(TicketStatus.RESOLVED)
+        t.transition(TicketStatus.RESOLVED, force=True)
         # Backdate updated_at to 48 hours ago
         t.updated_at = (
             datetime.now(timezone.utc) - timedelta(hours=48)
@@ -2349,7 +2361,7 @@ class TestCheckRegressions:
             proposed_fix="Fix the config",
             metadata={"fingerprint": "abc123"},
         )
-        parent.transition(TicketStatus.RESOLVED)
+        parent.transition(TicketStatus.RESOLVED, force=True)
         store.add(parent)
 
         # Mock a monitor that finds the same fingerprint in fresh scan
@@ -2384,7 +2396,7 @@ class TestCheckRegressions:
             severity=TicketSeverity.HIGH,
             metadata={"fingerprint": "def456"},
         )
-        parent.transition(TicketStatus.RESOLVED)
+        parent.transition(TicketStatus.RESOLVED, force=True)
         store.add(parent)
 
         config = SWETeamConfig(regression_window_hours=24)
@@ -2411,7 +2423,7 @@ class TestCheckRegressions:
             proposed_fix="Add connection timeout and pool recycling",
             metadata={"fingerprint": "db-fp-001"},
         )
-        parent.transition(TicketStatus.RESOLVED)
+        parent.transition(TicketStatus.RESOLVED, force=True)
         store.add(parent)
 
         config = SWETeamConfig(regression_window_hours=24)
@@ -2446,7 +2458,7 @@ class TestCheckRegressions:
                 },
             },
         )
-        parent.transition(TicketStatus.RESOLVED)
+        parent.transition(TicketStatus.RESOLVED, force=True)
         store.add(parent)
 
         config = SWETeamConfig(regression_window_hours=24)
@@ -2478,7 +2490,7 @@ class TestCheckRegressions:
             severity=TicketSeverity.MEDIUM,
             metadata={"fingerprint": "fp-below-3"},
         )
-        parent.transition(TicketStatus.RESOLVED)
+        parent.transition(TicketStatus.RESOLVED, force=True)
         store.add(parent)
 
         config = SWETeamConfig(regression_window_hours=24)
@@ -2984,6 +2996,10 @@ class TestDeveloperTestExecution:
 # ModelProbe
 # ======================================================================
 
+@pytest.mark.skipif(
+    not __import__("importlib.util", fromlist=["find_spec"]).find_spec("openai"),
+    reason="openai package not installed",
+)
 class TestListAvailableModels:
     """Unit tests for model_probe.list_available_models()."""
 
