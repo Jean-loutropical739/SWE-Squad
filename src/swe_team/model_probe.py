@@ -14,17 +14,74 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Failure cache: model -> timestamp of last failure.
+# Models that fail a probe are skipped for PROBE_FAILURE_TTL_SECS seconds.
+_probe_failure_cache: dict[str, float] = {}
+PROBE_FAILURE_TTL_SECS = 3600  # 1 hour
+
+
+def _is_probe_failed_recently(model: str) -> bool:
+    """Return True if *model* failed a probe within the failure TTL."""
+    ts = _probe_failure_cache.get(model)
+    if ts is None:
+        return False
+    if time.monotonic() - ts < PROBE_FAILURE_TTL_SECS:
+        return True
+    # TTL expired — remove stale entry
+    del _probe_failure_cache[model]
+    return False
+
+
+def _record_probe_failure(model: str) -> None:
+    """Record that *model* failed a probe right now."""
+    _probe_failure_cache[model] = time.monotonic()
+    logger.info(
+        "model_probe: '%s' probe failed — suppressing for %d min",
+        model, PROBE_FAILURE_TTL_SECS // 60,
+    )
+
 # Preference-ordered fallback lists per task type.
-# First match wins when the configured model is not available.
-_EMBEDDING_FALLBACKS = ["bge-m3", "mxbai-embed-large", "nomic-embed-text", "qwen3-embedding"]
-_EXTRACTION_FALLBACKS = ["gemini-3-flash", "qwen3:8b", "gemini-2.5-flash-thinking", "qwen3:4b"]
-_T1_FALLBACKS = ["gemini-3-flash", "qwen3:8b", "qwen3:4b"]
-_T2_FALLBACKS = ["gemini-2.5-flash-thinking", "qwen3:8b", "gemini-3-flash"]
-_T3_FALLBACKS = ["gemini-2.5-pro", "gemini-3-pro-high", "claude-opus-4-6", "gemini-2.5-flash-thinking"]
+# Each candidate is PROBED with a real API call before being selected.
+# Order: fastest/cheapest first, degrading gracefully to heavier models.
+# gemini-3-flash is known to return empty completions on this proxy — keep it
+# as a last-resort in case it's fixed, but never first.
+_EMBEDDING_FALLBACKS = [
+    "bge-m3",            # primary — fast, 1024-dim
+    "mxbai-embed-large", # fallback
+    "nomic-embed-text",  # fallback
+    "qwen3-embedding",   # fallback
+]
+_EXTRACTION_FALLBACKS = [
+    "deepseek-v3.1:671b-cloud",   # primary — reliable, strong reasoning
+    "gemini-2.5-flash-thinking",  # fallback
+    "qwen3-coder:30b",            # code-aware fallback
+    "deepseek-r1:14b",            # strong reasoning fallback
+    "qwen3:8b",                   # lightweight last resort
+]
+_T1_FALLBACKS = [                 # cheap/fast tasks via BASE_LLM proxy
+    "gemini-2.5-flash-thinking",
+    "qwen3:8b",
+    "qwen3:4b",
+    "deepseek-v3.1:671b-cloud",   # reliable fallback
+]
+_T2_FALLBACKS = [                 # standard tasks via BASE_LLM proxy
+    "gemini-2.5-flash-thinking",
+    "qwen3-coder:30b",
+    "deepseek-r1:14b",
+    "deepseek-v3.1:671b-cloud",   # reliable fallback
+]
+_T3_FALLBACKS = [                 # heavy/critical tasks via BASE_LLM proxy
+    "gemini-2.5-pro",
+    "gemini-3-pro-high",
+    "claude-opus-4-6",
+    "deepseek-v3.1:671b-cloud",
+    "gemini-2.5-flash-thinking",
+]
 
 
 def list_available_models(
@@ -47,6 +104,73 @@ def list_available_models(
     except Exception as exc:
         logger.warning("model_probe: could not list models from %s: %s", url, exc)
         return []
+
+
+def probe_embedding_model(
+    model: str,
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> bool:
+    """Test that *model* actually responds to an embed request.
+
+    Returns True on success, False on any error.  Uses a tiny probe string
+    to keep cost near zero.
+    """
+    url = api_url or os.getenv("BASE_LLM_API_URL")
+    key = api_key or os.getenv("BASE_LLM_API_KEY", "")
+    if not url:
+        return False
+    if _is_probe_failed_recently(model):
+        logger.debug("model_probe: skipping embed probe for '%s' (failed recently)", model)
+        return False
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=url, api_key=key, timeout=10, max_retries=0)
+        resp = client.embeddings.create(model=model, input="probe")
+        ok = bool(resp.data and resp.data[0].embedding)
+        if not ok:
+            logger.warning("model_probe: embed probe for '%s' returned empty result", model)
+            _record_probe_failure(model)
+        return ok
+    except Exception as exc:
+        logger.warning("model_probe: embed probe for '%s' failed: %s", model, exc)
+        _record_probe_failure(model)
+        return False
+
+
+def probe_chat_model(
+    model: str,
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> bool:
+    """Test that *model* actually responds to a minimal chat completion.
+
+    Returns True on success, False on any error.
+    """
+    url = api_url or os.getenv("BASE_LLM_API_URL")
+    key = api_key or os.getenv("BASE_LLM_API_KEY", "")
+    if not url:
+        return False
+    if _is_probe_failed_recently(model):
+        logger.debug("model_probe: skipping chat probe for '%s' (failed recently)", model)
+        return False
+    try:
+        from openai import OpenAI
+        client = OpenAI(base_url=url, api_key=key, timeout=10, max_retries=0)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=4,
+        )
+        ok = bool(resp.choices and resp.choices[0].message.content)
+        if not ok:
+            logger.warning("model_probe: chat probe for '%s' returned empty result", model)
+            _record_probe_failure(model)
+        return ok
+    except Exception as exc:
+        logger.warning("model_probe: chat probe for '%s' failed: %s", model, exc)
+        _record_probe_failure(model)
+        return False
 
 
 def select_model(
@@ -119,25 +243,69 @@ class ModelProbe:
     def validate_and_patch_env(self) -> dict[str, str]:
         """Validate key env-var models and patch os.environ with corrections.
 
-        Returns a dict of {env_var: corrected_value} for any vars that
-        were changed, so callers can log or alert.
+        For each model, first checks the proxy's model list, then sends an
+        actual probe request to confirm the model responds before committing
+        to it.  Falls back through the fallback list until one passes both
+        checks.
+
+        Returns a dict of {env_var: final_value} for any vars that were
+        changed so callers can log/alert.
+
+        Non-blocking: if the proxy is unreachable or all probes fail, returns
+        empty and keeps defaults so the rest of the pipeline can proceed.
         """
-        available = self.available
+        try:
+            available = self.available
+        except Exception as exc:
+            logger.warning("model_probe: proxy unreachable during validate_and_patch_env — skipping probe, using defaults: %s", exc)
+            return {}
         if not available:
+            logger.info("model_probe: no models available — skipping probe, using defaults")
             return {}
 
         patches: dict[str, str] = {}
 
         checks = [
-            ("EMBEDDING_MODEL", os.getenv("EMBEDDING_MODEL", "bge-m3"), _EMBEDDING_FALLBACKS, "embedding"),
-            ("EXTRACTION_MODEL", os.getenv("EXTRACTION_MODEL", "gemini-3-flash"), _EXTRACTION_FALLBACKS, "extraction"),
+            ("EMBEDDING_MODEL", os.getenv("EMBEDDING_MODEL", "bge-m3"), _EMBEDDING_FALLBACKS, "embedding", "embed"),
+            ("EXTRACTION_MODEL", os.getenv("EXTRACTION_MODEL", "deepseek-v3.1:671b-cloud"), _EXTRACTION_FALLBACKS, "extraction", "chat"),
         ]
 
-        for env_var, configured, fallbacks, task in checks:
-            corrected = select_model(configured, available, fallbacks, task)
-            if corrected != configured:
-                os.environ[env_var] = corrected
-                patches[env_var] = corrected
+        for env_var, configured, fallbacks, task, probe_type in checks:
+            # Build candidate list: configured first, then fallbacks
+            candidates = [configured] + [f for f in fallbacks if f != configured]
+            chosen = None
+            for candidate in candidates:
+                if candidate not in available:
+                    logger.debug("model_probe: '%s' not in proxy model list — skipping", candidate)
+                    continue
+                # Actually probe the model
+                if probe_type == "embed":
+                    ok = probe_embedding_model(candidate, self._api_url, self._api_key)
+                else:
+                    ok = probe_chat_model(candidate, self._api_url, self._api_key)
+                if ok:
+                    chosen = candidate
+                    break
+                logger.warning(
+                    "model_probe: '%s' listed but probe failed for %s — trying next fallback",
+                    candidate, task,
+                )
+
+            if chosen is None:
+                logger.error(
+                    "model_probe: ALL candidates failed probe for %s; keeping '%s'",
+                    task, configured,
+                )
+                chosen = configured  # keep original — let caller fail loudly
+
+            if chosen != configured:
+                logger.warning(
+                    "model_probe: using '%s' instead of '%s' for %s",
+                    chosen, configured, task,
+                )
+            os.environ[env_var] = chosen
+            if chosen != configured:
+                patches[env_var] = chosen
 
         return patches
 

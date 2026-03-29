@@ -3093,7 +3093,9 @@ class TestModelProbeValidateAndPatch:
         probe = ModelProbe(api_url="http://fake/v1", api_key="key")
         probe._available = ["mxbai-embed-large", "gemini-3-flash"]  # bge-m3 missing
 
-        with patch.dict(os.environ, {"EMBEDDING_MODEL": "bge-m3"}, clear=False):
+        with patch.dict(os.environ, {"EMBEDDING_MODEL": "bge-m3"}, clear=False), \
+             patch("src.swe_team.model_probe.probe_embedding_model", return_value=True), \
+             patch("src.swe_team.model_probe.probe_chat_model", return_value=True):
             patches = probe.validate_and_patch_env()
             assert "EMBEDDING_MODEL" in patches
             assert patches["EMBEDDING_MODEL"] == "mxbai-embed-large"
@@ -3105,7 +3107,9 @@ class TestModelProbeValidateAndPatch:
         probe = ModelProbe(api_url="http://fake/v1", api_key="key")
         probe._available = ["bge-m3", "gemini-3-flash"]
 
-        with patch.dict(os.environ, {"EMBEDDING_MODEL": "bge-m3", "EXTRACTION_MODEL": "gemini-3-flash"}, clear=False):
+        with patch.dict(os.environ, {"EMBEDDING_MODEL": "bge-m3", "EXTRACTION_MODEL": "gemini-3-flash"}, clear=False), \
+             patch("src.swe_team.model_probe.probe_embedding_model", return_value=True), \
+             patch("src.swe_team.model_probe.probe_chat_model", return_value=True):
             patches = probe.validate_and_patch_env()
 
         assert patches == {}
